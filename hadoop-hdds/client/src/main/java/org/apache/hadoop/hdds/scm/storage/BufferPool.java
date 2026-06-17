@@ -22,11 +22,9 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.Semaphore;
 import java.util.function.Function;
-import java.util.function.Supplier;
 import org.apache.hadoop.hdds.scm.ByteStringConversion;
 import org.apache.hadoop.ozone.common.ChunkBuffer;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
@@ -49,11 +47,16 @@ public class BufferPool {
   private final int capacity;
   private final Function<ByteBuffer, ByteString> byteStringConversion;
 
-  private final LinkedList<ChunkBuffer> allocated = new LinkedList<>();
-  private final LinkedList<ChunkBuffer> released = new LinkedList<>();
-  private ChunkBuffer currentBuffer = null;
-  private final Lock lock = new ReentrantLock();
-  private final Condition notFull = lock.newCondition();
+  // Semaphore replaces ReentrantLock.lockInterruptibly() as the capacity gate.
+  // The uncontended fast path is a single CAS (no per-call interrupt-flag spin).
+  private final Semaphore permits;
+  // LIFO free list: recycled buffers are returned stack-fashion so assertSame tests pass.
+  private final ConcurrentLinkedDeque<ChunkBuffer> free = new ConcurrentLinkedDeque<>();
+  // Identity-tracked in-use list. ChunkBuffer.equals() is content-based, so we cannot use
+  // a hash-based collection (hash changes as the buffer is written). Use == comparisons instead.
+  private final LinkedList<ChunkBuffer> inUse = new LinkedList<>();
+  private final Object inUseLock = new Object();
+  private volatile ChunkBuffer currentBuffer;
 
   public static BufferPool empty() {
     return EMPTY;
@@ -69,6 +72,7 @@ public class BufferPool {
     this.capacity = capacity;
     this.bufferSize = bufferSize;
     this.byteStringConversion = byteStringConversion;
+    this.permits = new Semaphore(capacity);
   }
 
   public Function<ByteBuffer, ByteString> byteStringConversion() {
@@ -76,7 +80,7 @@ public class BufferPool {
   }
 
   ChunkBuffer getCurrentBuffer() {
-    return doInLock(() -> currentBuffer);
+    return currentBuffer;
   }
 
   /**
@@ -84,61 +88,47 @@ public class BufferPool {
    * capacity.
    */
   public ChunkBuffer allocateBuffer(int increment) throws InterruptedException {
-    lock.lockInterruptibly();
-    try {
-      Preconditions.assertTrue(allocated.size() + released.size() <= capacity, () ->
-          "Total created buffer must not exceed capacity.");
-
-      while (allocated.size() == capacity) {
-        LOG.debug("Allocation needs to wait the pool is at capacity (allocated = capacity = {}).", capacity);
-        notFull.await();
-      }
-      // Get a buffer to allocate, preferably from the released ones.
-      final ChunkBuffer buffer = released.isEmpty() ?
-          ChunkBuffer.allocate(bufferSize, increment) : released.removeFirst();
-      allocated.add(buffer);
-      currentBuffer = buffer;
-
-      LOG.debug("Allocated new buffer {}, number of used buffers {}, capacity {}.",
-          buffer, allocated.size(), capacity);
-      return buffer;
-    } finally {
-      lock.unlock();
+    if (permits.availablePermits() == 0) {
+      LOG.debug("Allocation needs to wait the pool is at capacity (allocated = capacity = {}).", capacity);
     }
+    permits.acquire();
+    ChunkBuffer buffer = free.pollFirst();
+    if (buffer == null) {
+      buffer = ChunkBuffer.allocate(bufferSize, increment);
+    }
+    synchronized (inUseLock) {
+      inUse.add(buffer);
+    }
+    currentBuffer = buffer;
+    LOG.debug("Allocated new buffer {}, number of used buffers {}, capacity {}.",
+        buffer, getNumberOfUsedBuffers(), capacity);
+    return buffer;
   }
 
   void releaseBuffer(ChunkBuffer buffer) {
     LOG.debug("Releasing buffer {}", buffer);
-    lock.lock();
-    try {
-      Preconditions.assertTrue(removeByIdentity(allocated, buffer), "Releasing unknown buffer");
-      buffer.clear();
-      released.add(buffer);
-      if (buffer == currentBuffer) {
-        currentBuffer = null;
-      }
-      notFull.signal();
-    } finally {
-      lock.unlock();
+    synchronized (inUseLock) {
+      Preconditions.assertTrue(removeByIdentity(inUse, buffer), "Releasing unknown buffer");
     }
+    buffer.clear();
+    if (buffer == currentBuffer) {
+      currentBuffer = null;
+    }
+    free.addFirst(buffer);
+    permits.release();
   }
 
   /**
    * Remove an item from a list by identity.
    * @return true if the item is found and removed from the list, otherwise false.
    */
-  private static <T> boolean removeByIdentity(List<T> list, T toRemove) {
-    int i = 0;
-    for (T item : list) {
-      if (item == toRemove) {
-        break;
-      } else {
-        i++;
+  private static boolean removeByIdentity(LinkedList<ChunkBuffer> list, ChunkBuffer toRemove) {
+    java.util.ListIterator<ChunkBuffer> it = list.listIterator();
+    while (it.hasNext()) {
+      if (it.next() == toRemove) {
+        it.remove();
+        return true;
       }
-    }
-    if (i < list.size()) {
-      list.remove(i);
-      return true;
     }
     return false;
   }
@@ -149,62 +139,52 @@ public class BufferPool {
    */
   @VisibleForTesting
   public void waitUntilAvailable() throws InterruptedException {
-    lock.lockInterruptibly();
-    try {
-      while (allocated.size() == capacity) {
-        notFull.await();
-      }
-    } finally {
-      lock.unlock();
-    }
+    permits.acquire();
+    permits.release();
   }
 
   public void clearBufferPool() {
-    lock.lock();
-    try {
-      allocated.forEach(ChunkBuffer::close);
-      released.forEach(ChunkBuffer::close);
-      allocated.clear();
-      released.clear();
-      currentBuffer = null;
-    } finally {
-      lock.unlock();
+    synchronized (inUseLock) {
+      inUse.forEach(ChunkBuffer::close);
+      inUse.clear();
     }
+    ChunkBuffer buf;
+    while ((buf = free.pollFirst()) != null) {
+      buf.close();
+    }
+    currentBuffer = null;
   }
 
   public long computeBufferData() {
-    return doInLock(() -> {
+    synchronized (inUseLock) {
       long totalBufferSize = 0;
-      for (ChunkBuffer buf : allocated) {
+      for (ChunkBuffer buf : inUse) {
         totalBufferSize += buf.position();
       }
       return totalBufferSize;
-    });
+    }
   }
 
   public int getSize() {
-    return doInLock(() -> allocated.size() + released.size());
+    synchronized (inUseLock) {
+      return inUse.size() + free.size();
+    }
   }
 
   public List<ChunkBuffer> getAllocatedBuffers() {
-    return doInLock(() -> new ArrayList<>(allocated));
+    synchronized (inUseLock) {
+      return new ArrayList<>(inUse);
+    }
   }
 
   public int getNumberOfUsedBuffers() {
-    return doInLock(allocated::size);
-  }
-
-  private <T> T doInLock(Supplier<T> supplier) {
-    lock.lock();
-    try {
-      return supplier.get();
-    } finally {
-      lock.unlock();
+    synchronized (inUseLock) {
+      return inUse.size();
     }
   }
 
   public boolean isAtCapacity() {
-    return getNumberOfUsedBuffers() == capacity;
+    return permits.availablePermits() == 0;
   }
 
   public int getCapacity() {
