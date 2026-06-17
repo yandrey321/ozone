@@ -88,10 +88,10 @@ public class BufferPool {
    * capacity.
    */
   public ChunkBuffer allocateBuffer(int increment) throws InterruptedException {
-    if (permits.availablePermits() == 0) {
+    if (!permits.tryAcquire()) {
       LOG.debug("Allocation needs to wait the pool is at capacity (allocated = capacity = {}).", capacity);
+      permits.acquire();
     }
-    permits.acquire();
     ChunkBuffer buffer = free.pollFirst();
     if (buffer == null) {
       buffer = ChunkBuffer.allocate(bufferSize, increment);
