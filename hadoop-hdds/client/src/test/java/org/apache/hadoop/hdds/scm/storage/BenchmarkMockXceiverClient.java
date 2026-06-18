@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandResponseProto;
@@ -58,9 +59,14 @@ final class BenchmarkMockXceiverClient extends XceiverClientSpi {
 
   private final Pipeline pipeline;
   private final AtomicLong logIndex = new AtomicLong();
+  // Simulated Raft commit latency. The calling thread parks for this duration in
+  // watchForCommit(), mimicking the real-cluster scenario where the writer blocks
+  // waiting for consensus before allocating the next buffer.
+  private final long commitLatencyNs;
 
-  BenchmarkMockXceiverClient(Pipeline pipeline) {
+  BenchmarkMockXceiverClient(Pipeline pipeline, long commitLatencyNs) {
     this.pipeline = pipeline;
+    this.commitLatencyNs = commitLatencyNs;
   }
 
   @Override
@@ -123,6 +129,14 @@ final class BenchmarkMockXceiverClient extends XceiverClientSpi {
 
   @Override
   public CompletableFuture<XceiverClientReply> watchForCommit(long index) {
+    // Block the calling thread for commitLatencyNs to mimic the Raft leader
+    // requiring consensus before acknowledging a putBlock. This causes back-pressure:
+    // buffers stay in-flight, pool fills up, and concurrent threads thrash L3 cache
+    // while each writer waits — reproducing the cold-staging-buffer scenario captured
+    // by the real-cluster async-profiler (12% CPU in computeChecksum).
+    if (commitLatencyNs > 0) {
+      LockSupport.parkNanos(commitLatencyNs);
+    }
     final ContainerCommandResponseProto response =
         ContainerCommandResponseProto.newBuilder()
             .setCmdType(Type.WriteChunk)
