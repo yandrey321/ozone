@@ -37,6 +37,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.hdds.client.BlockID;
@@ -60,6 +61,7 @@ import org.apache.hadoop.ozone.om.protocol.OzoneManagerProtocol;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /**
  * Benchmark for ECFileChecksumHelper that measures the actual checksum
@@ -69,24 +71,27 @@ import org.junit.jupiter.api.Test;
  * Validates fixes to BaseFileChecksumHelper and ECFileChecksumHelper:
  *   Fix 1: BaseFileChecksumHelper 7-arg constructor no longer chains to 6-arg
  *           (redundant OM lookupKey RPC eliminated: 2 calls/file -> 1).
- *   Fix 2: ECFileChecksumHelper uses a deterministic pipeline ID so
- *           XceiverClientManager can cache and reuse gRPC connections
- *           (new connection per file -> one connection per placement group).
- *   Fix 3: Pipeline.newBuilder() instead of toBuilder() avoids an unnecessary
- *           SecureRandom.nextBytes call on every file.
+ *           Measured by runBenchmark.
+ *   Fix 3: ECFileChecksumHelper caches the STANDALONE checksum pipeline per
+ *           EC placement group; blocks 2..N within a file reuse the same
+ *           XceiverClient connection (new connections/file drops from N to 1).
+ *           Measured by runBlockCacheBenchmark.
  *
  * Covers RS-3-2 (5 nodes, 3 data + 2 parity) and RS-6-3 (9 nodes, 6 data + 3 parity).
  * For RS-3-2 the standalone pipeline has 3 selected nodes (index=1 + parity {4,5}),
  * stripe checksum = 12 bytes. For RS-6-3: 4 selected nodes (index=1 + parity {7,8,9}),
  * stripe checksum = 16 bytes.
  *
- * Each latency bucket runs a 10-second warmup followed by a 20-second
- * measurement window. Throughput and per-file RPC counts are reported from
- * the measurement window only.
+ * Each latency bucket runs a warmup followed by a 20-second measurement window.
+ * Throughput and per-file RPC counts are reported from the measurement window only.
  *
  * Run with:
  *   mvn test -pl hadoop-ozone/client \
  *     -Dtest=FileChecksumBenchmark#runBenchmark \
+ *     -Dsurefire.failIfNoSpecifiedTests=false
+ *
+ *   mvn test -pl hadoop-ozone/client \
+ *     -Dtest=FileChecksumBenchmark#runBlockCacheBenchmark \
  *     -Dsurefire.failIfNoSpecifiedTests=false
  *
  * To profile with async-profiler, pass the agent via surefire argLine, e.g.:
@@ -103,6 +108,12 @@ public class FileChecksumBenchmark {
   private static final int WARMUP_SECS = 10;
   private static final int MEASURE_SECS = 20;
   private static final int[] LATENCIES_MS = {0, 5, 10};
+  // Block-cache benchmark: shorter warmup, same measurement window.
+  // Grid: 2 EC configs × 3 latencies × 4 block variants × (5+20)s ≈ 10 minutes.
+  private static final int BLOCK_WARMUP_SECS = 5;
+  private static final int BLOCK_MEASURE_SECS = 20;
+  private static final int[] DN_LATENCIES_MS = {0, 5, 10};
+  private static final int[] BLOCKS_PER_FILE_VARIANTS = {1, 2, 3, 5};
   private static final long CONTAINER_ID = 1001L;
   private static final long FILE_SIZE = 5000L;
   // 136 = 4 x 34: every 4th file (idx % 4 == 0) gets a freshly built OmKeyInfo
@@ -134,11 +145,15 @@ public class FileChecksumBenchmark {
   // ---------------------------------------------------------------------------
 
   static class CountingXceiverClientFactory implements XceiverClientFactory {
-    // Stable pipeline IDs = KEY_POOL - KEY_POOL/UNSTABLE_STEP = 102.
-    // Cap the pool just above that so stable files always hit the cache while
-    // unstable files (random pipeline IDs) are never stored and are GC'd immediately.
-    private static final int MAX_POOL_SIZE = KEY_POOL - KEY_POOL / UNSTABLE_STEP + 10;
+    // For runBenchmark: cap just above the stable-pipeline count (102) so stable
+    // files hit the cache and unstable (random-UUID) files are GC'd immediately.
+    private static final int DEFAULT_MAX_POOL_SIZE = KEY_POOL - KEY_POOL / UNSTABLE_STEP + 10;
+    // For runBlockCacheBenchmark: Fix 3 assigns one random standalone pipeline per
+    // file; pool must accommodate all files in the measurement window (~14K at 5ms).
+    static final int BLOCK_CACHE_MAX_POOL_SIZE = 100_000;
     private final ContainerProtos.ContainerCommandResponseProto blockResponse;
+    private final int dnConnectionLatencyMs;
+    private final int maxPoolSize;
     private final AtomicLong newConnectionCount = new AtomicLong();
     private final AtomicLong reuseCount = new AtomicLong();
     // clientPool is intentionally NOT cleared between warmup and measurement:
@@ -149,7 +164,14 @@ public class FileChecksumBenchmark {
 
     CountingXceiverClientFactory(
         ContainerProtos.ContainerCommandResponseProto blockResponse) {
+      this(blockResponse, 0, DEFAULT_MAX_POOL_SIZE);
+    }
+
+    CountingXceiverClientFactory(ContainerProtos.ContainerCommandResponseProto blockResponse,
+        int dnConnectionLatencyMs, int maxPoolSize) {
       this.blockResponse = blockResponse;
+      this.dnConnectionLatencyMs = dnConnectionLatencyMs;
+      this.maxPoolSize = maxPoolSize;
     }
 
     void resetCounters() {
@@ -174,8 +196,16 @@ public class FileChecksumBenchmark {
         reuseCount.incrementAndGet();
         return existing;
       }
+      if (dnConnectionLatencyMs > 0) {
+        try {
+          Thread.sleep(dnConnectionLatencyMs);
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          throw new IOException(ie);
+        }
+      }
       XceiverClientSpi newClient = createMockDnClient(pipeline, blockResponse);
-      if (clientPool.size() < MAX_POOL_SIZE) {
+      if (clientPool.size() < maxPoolSize) {
         XceiverClientSpi winner = clientPool.putIfAbsent(key, newClient);
         if (winner != null) {
           reuseCount.incrementAndGet();
@@ -356,6 +386,70 @@ public class FileChecksumBenchmark {
         latencyMs);
   }
 
+  private static BenchmarkResult measureBlockCache(int blocksPerFile, int dnLatencyMs,
+      Pipeline ecPipeline, ECReplicationConfig ecConfig,
+      ContainerProtos.ContainerCommandResponseProto blockResponse) throws Exception {
+    AtomicLong omCallCount = new AtomicLong();
+    CountingXceiverClientFactory xceiverFactory = new CountingXceiverClientFactory(
+        blockResponse, dnLatencyMs, CountingXceiverClientFactory.BLOCK_CACHE_MAX_POOL_SIZE);
+    AtomicLong fileIdx = new AtomicLong();
+
+    OmKeyInfo[] keyInfos = buildKeyInfosMultiBlock(ecPipeline, blocksPerFile, ecConfig);
+    long fileLength = (long) blocksPerFile * FILE_SIZE;
+
+    OzoneManagerProtocol mockOm = mock(OzoneManagerProtocol.class);
+    when(mockOm.lookupKey(any(OmKeyArgs.class))).thenAnswer(invocation -> {
+      omCallCount.incrementAndGet();
+      OmKeyArgs args = invocation.getArgument(0);
+      int idx = Integer.parseInt(args.getKeyName().split("-")[1]);
+      return keyInfos[idx % KEY_POOL];
+    });
+
+    RpcClient mockRpcClient = mock(RpcClient.class);
+    when(mockRpcClient.getOzoneManagerClient()).thenReturn(mockOm);
+    when(mockRpcClient.getXceiverClientManager()).thenReturn(xceiverFactory);
+
+    OzoneVolume mockVolume = mock(OzoneVolume.class);
+    when(mockVolume.getName()).thenReturn("vol");
+    OzoneBucket mockBucket = mock(OzoneBucket.class);
+    when(mockBucket.getName()).thenReturn("bucket");
+
+    OzoneClientConfig.ChecksumCombineMode combineMode =
+        OzoneClientConfig.ChecksumCombineMode.COMPOSITE_CRC;
+
+    Runnable task = () -> {
+      try {
+        int idx = (int) (fileIdx.getAndIncrement() % KEY_POOL);
+        String keyName = "file-" + idx;
+        OmKeyInfo keyInfo = mockRpcClient.getOzoneManagerClient().lookupKey(
+            new OmKeyArgs.Builder()
+                .setVolumeName("vol")
+                .setBucketName("bucket")
+                .setKeyName(keyName)
+                .setSortDatanodesInPipeline(true)
+                .setLatestVersionLocation(true)
+                .build());
+        new ECFileChecksumHelper(
+            mockVolume, mockBucket, keyName, fileLength, combineMode, mockRpcClient, keyInfo)
+            .compute();
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    };
+
+    runFor(BLOCK_WARMUP_SECS * 1000L, task);
+    omCallCount.set(0);
+    xceiverFactory.resetCounters();
+    fileIdx.set(0);
+
+    long start = System.currentTimeMillis();
+    long measuredFiles = runFor(BLOCK_MEASURE_SECS * 1000L, task);
+    long wallMs = System.currentTimeMillis() - start;
+
+    return new BenchmarkResult(measuredFiles, wallMs, omCallCount.get(),
+        xceiverFactory.getNewConnectionCount(), xceiverFactory.getReuseCount(), dnLatencyMs);
+  }
+
   private static long runFor(long durationMs, Runnable task) throws Exception {
     AtomicBoolean running = new AtomicBoolean(true);
     AtomicLong count = new AtomicLong();
@@ -411,6 +505,61 @@ public class FileChecksumBenchmark {
       printRow(measure(latencyMs, EC63, EC63_KEY_INFOS, EC63_GET_BLOCK_RESPONSE));
     }
 
+  }
+
+  /**
+   * Measures Fix 3 (HDDS-15647): per-block pipeline caching in ECFileChecksumHelper.
+   *
+   * With fix: checksumPipelineCache returns the same Pipeline for all blocks in
+   * a file; acquireClientForReadData hits the pool for blocks 2..N
+   * (newConnections/file = 1 regardless of how many blocks).
+   *
+   * Without fix: buildChecksumPipeline called per block; toBuilder() with a
+   * different node count triggers PipelineID.randomId() → unique pipeline ID
+   * per block → pool miss per block (newConnections/file = blocksPerFile).
+   *
+   * dnConnectionLatencyMs simulates gRPC handshake cost. Reused connections
+   * skip the delay, so the speedup grows with latency and blocks/file.
+   */
+  @Test
+  @Timeout(value = 1200, unit = TimeUnit.SECONDS)
+  public void runBlockCacheBenchmark() throws Exception {
+    System.out.println();
+    System.out.println("=== ECFileChecksum Per-Block Pipeline Cache Benchmark ===");
+    System.out.printf("Workload: %d threads, %ds warmup + %ds measurement%n%n",
+        NUM_THREADS, BLOCK_WARMUP_SECS, BLOCK_MEASURE_SECS);
+
+    String[] ecLabels = {"RS-3-2", "RS-6-3"};
+    Pipeline[] ecPipelines = {EC_PIPELINE, EC63_PIPELINE};
+    ECReplicationConfig[] ecConfigs = {EC32, EC63};
+    ContainerProtos.ContainerCommandResponseProto[] blockResponses =
+        {GET_BLOCK_RESPONSE, EC63_GET_BLOCK_RESPONSE};
+
+    for (int ecIdx = 0; ecIdx < ecLabels.length; ecIdx++) {
+      System.out.printf("=== %s ===%n", ecLabels[ecIdx]);
+      for (int dnLatencyMs : DN_LATENCIES_MS) {
+        System.out.printf("DN connection latency = %dms%n", dnLatencyMs);
+        System.out.printf("%-14s  %-10s  %-12s  %-14s  %-14s  %-14s  %-14s  %-9s%n",
+            "Blocks/file", "Wall(ms)", "Files/s", "Blocks/s", "NewConn/file",
+            "XcNew(conn)", "XcReuse", "CacheHit%");
+        System.out.println(new String(new char[115]).replace('\0', '-'));
+
+        for (int blocksPerFile : BLOCKS_PER_FILE_VARIANTS) {
+          BenchmarkResult r = measureBlockCache(blocksPerFile, dnLatencyMs,
+              ecPipelines[ecIdx], ecConfigs[ecIdx], blockResponses[ecIdx]);
+          long totalBlocks = r.getMeasuredFiles() * blocksPerFile;
+          double blocksPerSec = r.getWallMs() == 0
+              ? Double.POSITIVE_INFINITY : totalBlocks * 1000.0 / r.getWallMs();
+          double newConnPerFile = r.getMeasuredFiles() == 0
+              ? 0 : (double) r.getXceiverNewCount() / r.getMeasuredFiles();
+          System.out.printf("%-14d  %-10d  %-12.1f  %-14.1f  %-14.2f  %-14d  %-14d  %d%%%n",
+              blocksPerFile, r.getWallMs(), r.filesPerSec(), blocksPerSec,
+              newConnPerFile, r.getXceiverNewCount(), r.getXceiverReuseCount(),
+              r.cacheHitPercent());
+        }
+        System.out.println();
+      }
+    }
   }
 
   private static void printRow(BenchmarkResult r) {
@@ -478,6 +627,35 @@ public class FileChecksumBenchmark {
           .setModificationTime(0L)
           .setDataSize(FILE_SIZE)
           .setReplicationConfig(repConfig)
+          .setFileChecksum(null)
+          .setAcls(Collections.emptyList())
+          .build();
+    }
+    return infos;
+  }
+
+  private static OmKeyInfo[] buildKeyInfosMultiBlock(Pipeline ecPipeline, int nBlocks,
+      ECReplicationConfig ecConfig) {
+    OmKeyInfo[] infos = new OmKeyInfo[KEY_POOL];
+    for (int i = 0; i < KEY_POOL; i++) {
+      List<OmKeyLocationInfo> locs = new ArrayList<>();
+      for (int b = 0; b < nBlocks; b++) {
+        locs.add(new OmKeyLocationInfo.Builder()
+            .setBlockID(new BlockID(CONTAINER_ID + b, i))
+            .setPipeline(ecPipeline)
+            .setLength(FILE_SIZE)
+            .build());
+      }
+      infos[i] = new OmKeyInfo.Builder()
+          .setVolumeName("vol")
+          .setBucketName("bucket")
+          .setKeyName("file-" + i)
+          .setOmKeyLocationInfos(Collections.singletonList(
+              new OmKeyLocationInfoGroup(0, locs)))
+          .setCreationTime(0L)
+          .setModificationTime(0L)
+          .setDataSize((long) nBlocks * FILE_SIZE)
+          .setReplicationConfig(ecConfig)
           .setFileChecksum(null)
           .setAcls(Collections.emptyList())
           .build();

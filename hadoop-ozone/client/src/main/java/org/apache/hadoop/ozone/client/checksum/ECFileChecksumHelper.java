@@ -18,13 +18,10 @@
 package org.apache.hadoop.ozone.client.checksum;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
-import java.util.stream.Collectors;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ECReplicationConfig;
 import org.apache.hadoop.hdds.client.StandaloneReplicationConfig;
@@ -49,6 +46,11 @@ import org.apache.hadoop.security.token.Token;
  */
 public class ECFileChecksumHelper extends BaseFileChecksumHelper {
 
+  // Blocks in the same EC placement group share identical node sets, so the
+  // STANDALONE checksum pipeline is the same for every block. Cache it to
+  // avoid rebuilding it (node filtering, toBuilder, object allocation) per block.
+  private final Map<PipelineID, Pipeline> checksumPipelineCache = new HashMap<>();
+
   public ECFileChecksumHelper(OzoneVolume volume, OzoneBucket bucket,
       String keyName, long length, OzoneClientConfig.ChecksumCombineMode
       checksumCombineMode, ClientProtocol rpcClient, OmKeyInfo keyInfo)
@@ -64,54 +66,12 @@ public class ECFileChecksumHelper extends BaseFileChecksumHelper {
   }
 
   @Override
-  protected List<ContainerProtos.ChunkInfo> getChunkInfos(OmKeyLocationInfo
-                                                              keyLocationInfo) throws IOException {
-    // To read an EC block, we create a STANDALONE pipeline that contains the
-    // single location for the block index we want to read. The EC blocks are
-    // indexed from 1 to N, however the data locations are stored in the
-    // dataLocations array indexed from zero.
+  protected List<ContainerProtos.ChunkInfo> getChunkInfos(OmKeyLocationInfo keyLocationInfo) throws IOException {
     Token<OzoneBlockTokenIdentifier> token = keyLocationInfo.getToken();
     BlockID blockID = keyLocationInfo.getBlockID();
-
-    Pipeline pipeline = keyLocationInfo.getPipeline();
-
-    List<DatanodeDetails> nodes = new ArrayList<>();
-    Map<DatanodeDetails, Integer> selectedReplicaIndexes = new HashMap<>();
-    ECReplicationConfig repConfig = (ECReplicationConfig)
-        pipeline.getReplicationConfig();
-
-    for (DatanodeDetails dn : pipeline.getNodes()) {
-      int replicaIndex = pipeline.getReplicaIndex(dn);
-      if (replicaIndex == 1 || replicaIndex > repConfig.getData()) {
-        // The stripe checksum we need to calculate checksums is only stored on
-        // replica_index = 1 and all the parity nodes.
-        nodes.add(dn);
-        selectedReplicaIndexes.put(dn, replicaIndex);
-      }
-    }
-
-    // Build a deterministic pipeline ID from the sorted node UUIDs so that
-    // XceiverClientManager can cache and reuse the gRPC connection across files
-    // that share the same EC placement group (avoids a new connection per file).
-    String nodeKey = nodes.stream()
-        .map(DatanodeDetails::getUuidString)
-        .sorted()
-        .collect(Collectors.joining(","));
-    PipelineID deterministicId = PipelineID.valueOf(
-        UUID.nameUUIDFromBytes(nodeKey.getBytes(StandardCharsets.UTF_8)));
-
-    // Use Pipeline.newBuilder() (not toBuilder()) so that nodeStatus starts null.
-    // toBuilder() would copy the 5-node EC nodeStatus, causing setNodes(3 nodes)
-    // to detect the size mismatch and call PipelineID.randomId() -> SecureRandom
-    // even though setId(deterministicId) immediately overrides it.
-    pipeline = Pipeline.newBuilder()
-        .setId(deterministicId)
-        .setReplicationConfig(StandaloneReplicationConfig
-            .getInstance(HddsProtos.ReplicationFactor.THREE))
-        .setState(pipeline.getPipelineState())
-        .setNodes(nodes)
-        .setReplicaIndexes(selectedReplicaIndexes)
-        .build();
+    Pipeline ecPipeline = keyLocationInfo.getPipeline();
+    Pipeline checksumPipeline = checksumPipelineCache.computeIfAbsent(
+        ecPipeline.getId(), id -> buildChecksumPipeline(ecPipeline));
 
     List<ContainerProtos.ChunkInfo> chunks;
     XceiverClientSpi xceiverClientSpi = null;
@@ -120,18 +80,37 @@ public class ECFileChecksumHelper extends BaseFileChecksumHelper {
         LOG.debug("Initializing BlockInputStream for get key to access {}",
             blockID.getContainerID());
       }
-      xceiverClientSpi = getXceiverClientFactory().acquireClientForReadData(pipeline);
+      xceiverClientSpi = getXceiverClientFactory().acquireClientForReadData(checksumPipeline);
 
       ContainerProtos.GetBlockResponseProto response = ContainerProtocolCalls
-          .getBlock(xceiverClientSpi, blockID, token, pipeline.getReplicaIndexes());
+          .getBlock(xceiverClientSpi, blockID, token, checksumPipeline.getReplicaIndexes());
 
       chunks = response.getBlockData().getChunksList();
     } finally {
       if (xceiverClientSpi != null) {
-        getXceiverClientFactory().releaseClientForReadData(
-            xceiverClientSpi, false);
+        getXceiverClientFactory().releaseClientForReadData(xceiverClientSpi, false);
       }
     }
     return chunks;
+  }
+
+  // To read an EC block we need a STANDALONE pipeline containing only replica
+  // index 1 (which holds stripe checksums) and the parity nodes. Blocks in the
+  // same placement group share the same node set, so this result is cached by
+  // the caller and built at most once per placement group per file.
+  private Pipeline buildChecksumPipeline(Pipeline ecPipeline) {
+    ECReplicationConfig repConfig = (ECReplicationConfig) ecPipeline.getReplicationConfig();
+    List<DatanodeDetails> nodes = new ArrayList<>();
+    for (DatanodeDetails dn : ecPipeline.getNodes()) {
+      int replicaIndex = ecPipeline.getReplicaIndex(dn);
+      if (replicaIndex == 1 || replicaIndex > repConfig.getData()) {
+        nodes.add(dn);
+      }
+    }
+    return ecPipeline.toBuilder()
+        .setReplicationConfig(StandaloneReplicationConfig
+            .getInstance(HddsProtos.ReplicationFactor.THREE))
+        .setNodes(nodes)
+        .build();
   }
 }
