@@ -72,10 +72,10 @@ import org.junit.jupiter.api.Timeout;
  *   Fix 1: BaseFileChecksumHelper 7-arg constructor no longer chains to 6-arg
  *           (redundant OM lookupKey RPC eliminated: 2 calls/file -> 1).
  *           Measured by runBenchmark.
- *   Fix 3: ECFileChecksumHelper caches the STANDALONE checksum pipeline per
- *           EC placement group; blocks 2..N within a file reuse the same
- *           XceiverClient connection (new connections/file drops from N to 1).
- *           Measured by runBlockCacheBenchmark.
+ *   Fix 2+3 combined: ECFileChecksumHelper caches the STANDALONE checksum
+ *           pipeline per EC placement group (Fix 3 intra-file reuse) and
+ *           derives its ID deterministically from the sorted node UUIDs
+ *           (Fix 2 cross-file reuse). Measured by runBlockCacheBenchmark.
  *
  * Covers RS-3-2 (5 nodes, 3 data + 2 parity) and RS-6-3 (9 nodes, 6 data + 3 parity).
  * For RS-3-2 the standalone pipeline has 3 selected nodes (index=1 + parity {4,5}),
@@ -148,9 +148,11 @@ public class FileChecksumBenchmark {
     // For runBenchmark: cap just above the stable-pipeline count (102) so stable
     // files hit the cache and unstable (random-UUID) files are GC'd immediately.
     private static final int DEFAULT_MAX_POOL_SIZE = KEY_POOL - KEY_POOL / UNSTABLE_STEP + 10;
-    // For runBlockCacheBenchmark: Fix 3 assigns one random standalone pipeline per
-    // file; pool must accommodate all files in the measurement window (~14K at 5ms).
-    static final int BLOCK_CACHE_MAX_POOL_SIZE = 100_000;
+    // For runBlockCacheBenchmark Scenario A: each file generates a fresh unique standalone
+    // pipeline. Pool must hold all unique entries from warmup + measurement so blocks 2..N
+    // can reuse the entry block 1 just added. At 0ms, peak throughput is ~35K files/s;
+    // 2M entries comfortably covers 5s warmup + 20s measurement across all block counts.
+    static final int BLOCK_CACHE_MAX_POOL_SIZE = 2_000_000;
     private final ContainerProtos.ContainerCommandResponseProto blockResponse;
     private final int dnConnectionLatencyMs;
     private final int maxPoolSize;
@@ -386,23 +388,40 @@ public class FileChecksumBenchmark {
         latencyMs);
   }
 
+  /**
+   * Measures ECFileChecksumHelper throughput for multi-block files.
+   *
+   * @param freshEcConfig when non-null, each lookupKey call returns a freshly built OmKeyInfo
+   *     with a unique EC pipeline (unique node-0 UUID per call). Simulates Fix-3-only behavior
+   *     where the standalone pipeline ID is random per file → block 1 always misses the
+   *     XceiverClient pool. Pass null to use the pre-built {@code keyInfos} array instead.
+   * @param keyInfos pre-built OmKeyInfo pool for Scenario B (shared pipeline). Ignored when
+   *     {@code freshEcConfig} is non-null.
+   */
   private static BenchmarkResult measureBlockCache(int blocksPerFile, int dnLatencyMs,
-      Pipeline ecPipeline, ECReplicationConfig ecConfig,
-      ContainerProtos.ContainerCommandResponseProto blockResponse) throws Exception {
+      ECReplicationConfig freshEcConfig, OmKeyInfo[] keyInfos,
+      ContainerProtos.ContainerCommandResponseProto blockResponse)
+      throws Exception {
     AtomicLong omCallCount = new AtomicLong();
     CountingXceiverClientFactory xceiverFactory = new CountingXceiverClientFactory(
         blockResponse, dnLatencyMs, CountingXceiverClientFactory.BLOCK_CACHE_MAX_POOL_SIZE);
     AtomicLong fileIdx = new AtomicLong();
+    AtomicLong fileSeq = new AtomicLong();
 
-    OmKeyInfo[] keyInfos = buildKeyInfosMultiBlock(ecPipeline, blocksPerFile, ecConfig);
     long fileLength = (long) blocksPerFile * FILE_SIZE;
+    int nodeCount = freshEcConfig != null ? freshEcConfig.getData() + freshEcConfig.getParity() : 0;
 
     OzoneManagerProtocol mockOm = mock(OzoneManagerProtocol.class);
     when(mockOm.lookupKey(any(OmKeyArgs.class))).thenAnswer(invocation -> {
       omCallCount.incrementAndGet();
       OmKeyArgs args = invocation.getArgument(0);
-      int idx = Integer.parseInt(args.getKeyName().split("-")[1]);
-      return keyInfos[idx % KEY_POOL];
+      if (keyInfos != null) {
+        int idx = Integer.parseInt(args.getKeyName().split("-")[1]);
+        return keyInfos[idx % KEY_POOL];
+      }
+      // Fresh mode: unique EC pipeline per call so block 1 always misses the XceiverClient pool.
+      return buildFreshOmKeyInfo(args.getKeyName(), fileSeq.getAndIncrement(),
+          blocksPerFile, fileLength, freshEcConfig, nodeCount);
     });
 
     RpcClient mockRpcClient = mock(RpcClient.class);
@@ -508,21 +527,27 @@ public class FileChecksumBenchmark {
   }
 
   /**
-   * Measures Fix 3 (HDDS-15647): per-block pipeline caching in ECFileChecksumHelper.
+   * Compares two scenarios for multi-block EC file checksum collection:
    *
-   * With fix: checksumPipelineCache returns the same Pipeline for all blocks in
-   * a file; acquireClientForReadData hits the pool for blocks 2..N
-   * (newConnections/file = 1 regardless of how many blocks).
+   * Scenario A — Fix 3 only (per-file unique pipeline, no cross-file pool reuse):
+   *   Each file lands on a distinct EC placement group (unique node 0 UUID),
+   *   so buildChecksumPipeline produces a unique deterministic pipeline ID
+   *   per file. Block 1 of every file always opens a new DN connection
+   *   (pool miss), while blocks 2..N reuse the same connection within the file.
+   *   Expected: NewConn/file = 1.00 at any latency.
    *
-   * Without fix: buildChecksumPipeline called per block; toBuilder() with a
-   * different node count triggers PipelineID.randomId() → unique pipeline ID
-   * per block → pool miss per block (newConnections/file = blocksPerFile).
+   * Scenario B — Fix 2+3 combined (shared pipeline, cross-file + intra-file reuse):
+   *   All files share the same EC placement group (same node UUIDs).
+   *   buildChecksumPipeline produces the same deterministic pipeline ID for
+   *   every file, so after the pool warms up during the warmup phase, every
+   *   subsequent connection (including block 1 of each file) is a pool hit.
+   *   Expected: NewConn/file ≈ 0.00 at any latency after warmup.
    *
-   * dnConnectionLatencyMs simulates gRPC handshake cost. Reused connections
-   * skip the delay, so the speedup grows with latency and blocks/file.
+   * The speedup of B over A equals the cost of one DN connection per file,
+   * which is especially significant at high latency (5ms, 10ms).
    */
   @Test
-  @Timeout(value = 1200, unit = TimeUnit.SECONDS)
+  @Timeout(value = 2400, unit = TimeUnit.SECONDS)
   public void runBlockCacheBenchmark() throws Exception {
     System.out.println();
     System.out.println("=== ECFileChecksum Per-Block Pipeline Cache Benchmark ===");
@@ -530,36 +555,53 @@ public class FileChecksumBenchmark {
         NUM_THREADS, BLOCK_WARMUP_SECS, BLOCK_MEASURE_SECS);
 
     String[] ecLabels = {"RS-3-2", "RS-6-3"};
-    Pipeline[] ecPipelines = {EC_PIPELINE, EC63_PIPELINE};
     ECReplicationConfig[] ecConfigs = {EC32, EC63};
     ContainerProtos.ContainerCommandResponseProto[] blockResponses =
         {GET_BLOCK_RESPONSE, EC63_GET_BLOCK_RESPONSE};
 
+    String rowFmt = "%-6d  %-10d  %-10.1f  %-13.2f  %-11d  %-9d  %-9s";
+    String hdr = String.format("%-6s  %-10s  %-10s  %-13s  %-11s  %-9s  %-9s",
+        "Blk/f", "Wall(ms)", "Files/s", "NewConn/file", "XcNew", "XcReuse", "CacheHit%");
+    String rule = new String(new char[hdr.length()]).replace('\0', '-');
+
     for (int ecIdx = 0; ecIdx < ecLabels.length; ecIdx++) {
       System.out.printf("=== %s ===%n", ecLabels[ecIdx]);
-      for (int dnLatencyMs : DN_LATENCIES_MS) {
-        System.out.printf("DN connection latency = %dms%n", dnLatencyMs);
-        System.out.printf("%-14s  %-10s  %-12s  %-14s  %-14s  %-14s  %-14s  %-9s%n",
-            "Blocks/file", "Wall(ms)", "Files/s", "Blocks/s", "NewConn/file",
-            "XcNew(conn)", "XcReuse", "CacheHit%");
-        System.out.println(new String(new char[115]).replace('\0', '-'));
 
+      for (int dnLatencyMs : DN_LATENCIES_MS) {
+        System.out.printf("DN latency = %dms%n", dnLatencyMs);
+
+        System.out.println("  [A] Fix 3 only: per-file unique pipeline (intra-file reuse, no cross-file reuse)");
+        System.out.println("  " + hdr);
+        System.out.println("  " + rule);
         for (int blocksPerFile : BLOCKS_PER_FILE_VARIANTS) {
           BenchmarkResult r = measureBlockCache(blocksPerFile, dnLatencyMs,
-              ecPipelines[ecIdx], ecConfigs[ecIdx], blockResponses[ecIdx]);
-          long totalBlocks = r.getMeasuredFiles() * blocksPerFile;
-          double blocksPerSec = r.getWallMs() == 0
-              ? Double.POSITIVE_INFINITY : totalBlocks * 1000.0 / r.getWallMs();
-          double newConnPerFile = r.getMeasuredFiles() == 0
-              ? 0 : (double) r.getXceiverNewCount() / r.getMeasuredFiles();
-          System.out.printf("%-14d  %-10d  %-12.1f  %-14.1f  %-14.2f  %-14d  %-14d  %d%%%n",
-              blocksPerFile, r.getWallMs(), r.filesPerSec(), blocksPerSec,
-              newConnPerFile, r.getXceiverNewCount(), r.getXceiverReuseCount(),
-              r.cacheHitPercent());
+              ecConfigs[ecIdx], null, blockResponses[ecIdx]);
+          printBlockCacheRow(rowFmt, blocksPerFile, r);
+        }
+
+        System.out.println();
+        System.out.println("  [B] Fix 2+3: shared pipeline (intra-file + cross-file reuse)");
+        System.out.println("  " + hdr);
+        System.out.println("  " + rule);
+        for (int blocksPerFile : BLOCKS_PER_FILE_VARIANTS) {
+          OmKeyInfo[] sharedInfos = buildKeyInfosMultiBlock(
+              ecIdx == 0 ? EC_PIPELINE : EC63_PIPELINE, blocksPerFile, ecConfigs[ecIdx]);
+          BenchmarkResult r = measureBlockCache(blocksPerFile, dnLatencyMs,
+              null, sharedInfos, blockResponses[ecIdx]);
+          printBlockCacheRow(rowFmt, blocksPerFile, r);
         }
         System.out.println();
       }
     }
+  }
+
+  private static void printBlockCacheRow(String fmt, int blocksPerFile, BenchmarkResult r) {
+    double newConnPerFile = r.getMeasuredFiles() == 0
+        ? 0 : (double) r.getXceiverNewCount() / r.getMeasuredFiles();
+    System.out.printf("  " + fmt + "%n",
+        blocksPerFile, r.getWallMs(), r.filesPerSec(), newConnPerFile,
+        r.getXceiverNewCount(), r.getXceiverReuseCount(),
+        r.cacheHitPercent() + "%");
   }
 
   private static void printRow(BenchmarkResult r) {
@@ -661,6 +703,53 @@ public class FileChecksumBenchmark {
           .build();
     }
     return infos;
+  }
+
+  /**
+   * Builds an OmKeyInfo with a fresh unique EC pipeline: node 0 gets UUID derived from
+   * {@code seq} (unique per call), all other nodes get stable UUIDs. This ensures
+   * buildChecksumPipeline produces a unique deterministic standalone pipeline ID per call,
+   * so block 1 of each file always misses the XceiverClient pool regardless of warmup.
+   * Used to simulate Fix-3-only behavior in the block-cache benchmark.
+   */
+  private static OmKeyInfo buildFreshOmKeyInfo(String keyName, long seq, int nBlocks,
+      long fileLength, ECReplicationConfig ecConfig, int nodeCount) {
+    List<DatanodeDetails> nodes = new ArrayList<>();
+    Map<DatanodeDetails, Integer> replicaIndexes = new HashMap<>();
+    for (int n = 0; n < nodeCount; n++) {
+      // Node 0 (replica index 1) gets a unique UUID per seq value.
+      // Use mostSigBits=1 so it never collides with stable parity-node UUIDs (mostSigBits=0).
+      UUID uuid = n == 0
+          ? new UUID(1L, seq)
+          : UUID.fromString("00000000-0000-0000-0000-00000000000" + n);
+      nodes.add(DatanodeDetails.newBuilder()
+          .setUuid(uuid).setHostName("dn" + n).setIpAddress("10.0.0." + n).build());
+      replicaIndexes.put(nodes.get(n), n + 1);
+    }
+    Pipeline ecPipeline = Pipeline.newBuilder()
+        .setId(PipelineID.randomId())
+        .setReplicationConfig(ecConfig)
+        .setState(Pipeline.PipelineState.CLOSED)
+        .setNodes(nodes)
+        .setReplicaIndexes(replicaIndexes)
+        .build();
+    List<OmKeyLocationInfo> locs = new ArrayList<>();
+    for (int b = 0; b < nBlocks; b++) {
+      locs.add(new OmKeyLocationInfo.Builder()
+          .setBlockID(new BlockID(CONTAINER_ID + b, (int) seq))
+          .setPipeline(ecPipeline)
+          .setLength(FILE_SIZE)
+          .build());
+    }
+    return new OmKeyInfo.Builder()
+        .setVolumeName("vol").setBucketName("bucket").setKeyName(keyName)
+        .setOmKeyLocationInfos(Collections.singletonList(
+            new OmKeyLocationInfoGroup(0, locs)))
+        .setCreationTime(0L).setModificationTime(0L)
+        .setDataSize(fileLength)
+        .setReplicationConfig(ecConfig)
+        .setFileChecksum(null).setAcls(Collections.emptyList())
+        .build();
   }
 
   private static ContainerProtos.ContainerCommandResponseProto buildGetBlockResponse(

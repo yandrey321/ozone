@@ -18,10 +18,13 @@
 package org.apache.hadoop.ozone.client.checksum;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Collectors;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.client.ECReplicationConfig;
 import org.apache.hadoop.hdds.client.StandaloneReplicationConfig;
@@ -48,7 +51,7 @@ public class ECFileChecksumHelper extends BaseFileChecksumHelper {
 
   // Blocks in the same EC placement group share identical node sets, so the
   // STANDALONE checksum pipeline is the same for every block. Cache it to
-  // avoid rebuilding it (node filtering, toBuilder, object allocation) per block.
+  // avoid rebuilding it (node filtering, UUID computation, object allocation) per block.
   private final Map<PipelineID, Pipeline> checksumPipelineCache = new HashMap<>();
 
   public ECFileChecksumHelper(OzoneVolume volume, OzoneBucket bucket,
@@ -98,19 +101,37 @@ public class ECFileChecksumHelper extends BaseFileChecksumHelper {
   // index 1 (which holds stripe checksums) and the parity nodes. Blocks in the
   // same placement group share the same node set, so this result is cached by
   // the caller and built at most once per placement group per file.
+  //
+  // The pipeline ID is derived deterministically from the sorted node UUIDs so
+  // that XceiverClientManager can reuse the same gRPC connection across files
+  // that land on the same EC placement group (cross-file reuse).
+  // Pipeline.newBuilder() is used instead of toBuilder() because toBuilder()
+  // copies the EC nodeStatus; the size mismatch when setNodes() is called
+  // triggers PipelineID.randomId() and defeats the deterministic ID.
   private Pipeline buildChecksumPipeline(Pipeline ecPipeline) {
     ECReplicationConfig repConfig = (ECReplicationConfig) ecPipeline.getReplicationConfig();
     List<DatanodeDetails> nodes = new ArrayList<>();
+    Map<DatanodeDetails, Integer> replicaIndexes = new HashMap<>();
     for (DatanodeDetails dn : ecPipeline.getNodes()) {
       int replicaIndex = ecPipeline.getReplicaIndex(dn);
       if (replicaIndex == 1 || replicaIndex > repConfig.getData()) {
         nodes.add(dn);
+        replicaIndexes.put(dn, replicaIndex);
       }
     }
-    return ecPipeline.toBuilder()
+    String nodeKey = nodes.stream()
+        .map(DatanodeDetails::getUuidString)
+        .sorted()
+        .collect(Collectors.joining(","));
+    PipelineID deterministicId = PipelineID.valueOf(
+        UUID.nameUUIDFromBytes(nodeKey.getBytes(StandardCharsets.UTF_8)));
+    return Pipeline.newBuilder()
+        .setId(deterministicId)
         .setReplicationConfig(StandaloneReplicationConfig
             .getInstance(HddsProtos.ReplicationFactor.THREE))
+        .setState(ecPipeline.getPipelineState())
         .setNodes(nodes)
+        .setReplicaIndexes(replicaIndexes)
         .build();
   }
 }
