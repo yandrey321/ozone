@@ -22,19 +22,29 @@ import static org.apache.hadoop.hdds.client.ReplicationFactor.ONE;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChecksumType.CRC32;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import jakarta.annotation.Nonnull;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 import org.apache.hadoop.fs.FileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32FileChecksum;
 import org.apache.hadoop.fs.MD5MD5CRC32GzipFileChecksum;
@@ -43,6 +53,7 @@ import org.apache.hadoop.hdds.client.ECReplicationConfig;
 import org.apache.hadoop.hdds.client.RatisReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.client.ReplicationType;
+import org.apache.hadoop.hdds.client.StandaloneReplicationConfig;
 import org.apache.hadoop.hdds.conf.InMemoryConfigurationForTesting;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
@@ -76,11 +87,17 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Unit tests for Replicated and EC FileChecksumHelper class.
  */
 public class TestFileChecksumHelper {
+  // RS-6-3: replica indexes 1..9. The checksum pipeline keeps index 1 plus the
+  // three parity nodes (indexes 7, 8, 9) and drops data indexes 2..6.
+  private static final int EC_DATA = 6;
+  private static final int EC_PARITY = 3;
+
   private final FileChecksum noCachedChecksum = null;
   private OzoneClient client;
   private ObjectStore store;
@@ -161,6 +178,152 @@ public class TestFileChecksumHelper {
         .setState(Pipeline.PipelineState.CLOSED)
         .setNodes(datanodeDetails)
         .build();
+  }
+
+  private List<DatanodeDetails> ecNodes() {
+    List<DatanodeDetails> nodes = new ArrayList<>();
+    for (int i = 0; i < EC_DATA + EC_PARITY; i++) {
+      nodes.add(DatanodeDetails.newBuilder().setUuid(UUID.randomUUID()).build());
+    }
+    return nodes;
+  }
+
+  private Pipeline ecPipeline(List<DatanodeDetails> nodes, PipelineID id) {
+    Map<DatanodeDetails, Integer> replicaIndexes = new HashMap<>();
+    for (int i = 0; i < nodes.size(); i++) {
+      replicaIndexes.put(nodes.get(i), i + 1);
+    }
+    return Pipeline.newBuilder()
+        .setId(id)
+        .setReplicationConfig(new ECReplicationConfig(EC_DATA, EC_PARITY))
+        .setState(Pipeline.PipelineState.CLOSED)
+        .setNodes(nodes)
+        .setReplicaIndexes(replicaIndexes)
+        .build();
+  }
+
+  private OmKeyLocationInfo ecBlock(long localId, Pipeline pipeline) {
+    return new OmKeyLocationInfo.Builder()
+        .setPipeline(pipeline)
+        .setBlockID(new BlockID(1, localId))
+        .setLength(100)
+        .build();
+  }
+
+  private ECFileChecksumHelper ecHelper(List<OmKeyLocationInfo> blocks,
+      XceiverClientFactory factory) throws IOException {
+    RpcClient mockRpcClient = mock(RpcClient.class);
+    when(mockRpcClient.getXceiverClientManager()).thenReturn(factory);
+    OzoneVolume mockVolume = mock(OzoneVolume.class);
+    when(mockVolume.getName()).thenReturn("vol1");
+    OzoneBucket mockBucket = mock(OzoneBucket.class);
+    when(mockBucket.getName()).thenReturn("bucket1");
+    OmKeyInfo keyInfo = omKeyInfo(ReplicationType.EC, noCachedChecksum, blocks);
+    return new ECFileChecksumHelper(mockVolume, mockBucket, "dummy",
+        100L * blocks.size(), OzoneClientConfig.ChecksumCombineMode.MD5MD5CRC,
+        mockRpcClient, keyInfo);
+  }
+
+  private XceiverClientFactory ecReadFactory(ArgumentCaptor<Pipeline> captor) throws IOException {
+    OzoneConfiguration conf = new OzoneConfiguration();
+    XceiverClientGrpc grpc = new XceiverClientGrpc(pipeline(ReplicationType.EC, ecNodes()), conf) {
+      @Override
+      public XceiverClientReply sendCommandAsync(
+          ContainerProtos.ContainerCommandRequestProto request, DatanodeDetails dn) {
+        return buildValidResponse(ReplicationType.EC);
+      }
+    };
+    XceiverClientFactory factory = mock(XceiverClientFactory.class);
+    when(factory.acquireClientForReadData(captor.capture())).thenReturn(grpc);
+    return factory;
+  }
+
+  /**
+   * Blocks that share the same EC pipeline ID must reuse a single cached
+   * STANDALONE checksum pipeline, which is filtered down to replica index 1
+   * plus the parity nodes and given a deterministic ID from the sorted node
+   * UUIDs. Exercises the cache-hit path and the node-filter branches.
+   */
+  @Test
+  public void testEcChecksumPipelineCachedAndFilteredAcrossBlocks() throws IOException {
+    List<DatanodeDetails> nodes = ecNodes();
+    Pipeline sharedPipeline = ecPipeline(nodes, PipelineID.randomId());
+    List<OmKeyLocationInfo> blocks = Arrays.asList(
+        ecBlock(1, sharedPipeline), ecBlock(2, sharedPipeline));
+
+    ArgumentCaptor<Pipeline> captor = ArgumentCaptor.forClass(Pipeline.class);
+    XceiverClientFactory factory = ecReadFactory(captor);
+    ECFileChecksumHelper helper = ecHelper(blocks, factory);
+
+    helper.compute();
+
+    assertInstanceOf(MD5MD5CRC32GzipFileChecksum.class, helper.getFileChecksum());
+
+    List<Pipeline> acquired = captor.getAllValues();
+    assertEquals(2, acquired.size());
+    // Both blocks acquired the identical cached instance (cache hit on block 2).
+    assertSame(acquired.get(0), acquired.get(1));
+
+    Pipeline checksumPipeline = acquired.get(0);
+    assertInstanceOf(StandaloneReplicationConfig.class, checksumPipeline.getReplicationConfig());
+    // index 1 + parity {7, 8, 9}; data indexes 2..6 are filtered out.
+    assertEquals(1 + EC_PARITY, checksumPipeline.getNodes().size());
+    for (DatanodeDetails dn : checksumPipeline.getNodes()) {
+      int ri = checksumPipeline.getReplicaIndex(dn);
+      assertTrue(ri == 1 || ri > EC_DATA, "unexpected replica index " + ri);
+    }
+    String nodeKey = checksumPipeline.getNodes().stream()
+        .map(DatanodeDetails::getUuidString)
+        .sorted()
+        .collect(Collectors.joining(","));
+    assertEquals(PipelineID.valueOf(UUID.nameUUIDFromBytes(nodeKey.getBytes(UTF_8))),
+        checksumPipeline.getId());
+  }
+
+  /**
+   * Blocks carrying distinct EC pipeline IDs miss the cache and rebuild the
+   * checksum pipeline, but the deterministic ID keeps them equal so the
+   * XceiverClient pool can still be reused. Exercises the cache-miss path.
+   */
+  @Test
+  public void testEcChecksumPipelineRebuiltForDistinctPipelineIds() throws IOException {
+    List<DatanodeDetails> nodes = ecNodes();
+    List<OmKeyLocationInfo> blocks = Arrays.asList(
+        ecBlock(1, ecPipeline(nodes, PipelineID.randomId())),
+        ecBlock(2, ecPipeline(nodes, PipelineID.randomId())));
+
+    ArgumentCaptor<Pipeline> captor = ArgumentCaptor.forClass(Pipeline.class);
+    ECFileChecksumHelper helper = ecHelper(blocks, ecReadFactory(captor));
+
+    helper.compute();
+
+    assertInstanceOf(MD5MD5CRC32GzipFileChecksum.class, helper.getFileChecksum());
+    List<Pipeline> acquired = captor.getAllValues();
+    assertEquals(2, acquired.size());
+    // Distinct EC IDs miss the cache, so each block builds its own instance ...
+    assertNotSame(acquired.get(0), acquired.get(1));
+    // ... yet the deterministic ID (same nodes) is identical for pool reuse.
+    assertEquals(acquired.get(0).getId(), acquired.get(1).getId());
+  }
+
+  /**
+   * When acquiring the read client fails, getChunkInfos must not attempt to
+   * release a client. Exercises the {@code xceiverClientSpi == null} branch of
+   * the finally block.
+   */
+  @Test
+  public void testEcChecksumAcquireFailureSkipsRelease() throws IOException {
+    List<DatanodeDetails> nodes = ecNodes();
+    List<OmKeyLocationInfo> blocks = Collections.singletonList(
+        ecBlock(1, ecPipeline(nodes, PipelineID.randomId())));
+
+    XceiverClientFactory factory = mock(XceiverClientFactory.class);
+    when(factory.acquireClientForReadData(any()))
+        .thenThrow(new IOException("acquire failed"));
+    ECFileChecksumHelper helper = ecHelper(blocks, factory);
+
+    assertThrows(IOException.class, helper::compute);
+    verify(factory, never()).releaseClientForReadData(any(), anyBoolean());
   }
 
   @ParameterizedTest
