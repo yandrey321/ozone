@@ -511,36 +511,24 @@ public class FileChecksumBenchmark {
   }
 
   /**
-   * Compares Fix 1+2 (no intra-file cache) against Fix 1+2+3 (with intra-file cache)
-   * for multi-block EC file checksum collection. Both scenarios use the same 15-node
-   * cluster pool and the same random-placement file generation, so the only variable
-   * is whether Fix 3 (checksumPipelineCache per ECFileChecksumHelper instance) is active.
+   * Measures multi-block EC file checksum collection through the real
+   * ECFileChecksumHelper.compute() path. All N blocks of each file share one EC
+   * placement group (the case the checksumPipelineCache is designed for) and the
+   * files are drawn from a 15-node cluster with random placement, so the
+   * deterministic standalone pipeline ID keeps the XceiverClient pool warm
+   * (NewConn/file ≈ 0.00) regardless of the fix under test.
    *
-   * Scenario A — Fix 1+2 only (no intra-file pipeline cache):
-   *   Each file uses the same randomly-selected node subset, but every block in the
-   *   file carries a distinct EC pipeline ID (PipelineID.randomId() per block). The
-   *   checksumPipelineCache in ECFileChecksumHelper sees N distinct IDs → N
-   *   buildChecksumPipeline calls per file. Fix 2 is still active: each call derives
-   *   the same deterministic standalone pipeline ID from the sorted node UUIDs, so
-   *   the XceiverClient pool is reused across files after warmup.
-   *   Expected: NewConn/file ≈ 0.00, CacheHit% = 0% for all block counts.
-   *
-   * Scenario B — Fix 1+2+3 combined (intra-file + cross-file reuse):
-   *   All N blocks in each file share one EC pipeline ID. The checksumPipelineCache
-   *   fires for blocks 2..N → 1 buildChecksumPipeline call per file instead of N.
-   *   Fix 2 continues to give cross-file pool reuse.
-   *   Expected: NewConn/file ≈ 0.00, CacheHit% = (N-1)/N for N-block files.
-   *
-   * Throughput difference reflects the overhead of N vs 1 buildChecksumPipeline
-   * calls per file. At 0ms DN latency this overhead dominates; at higher latencies
-   * the DN sleep cost is amortized across connections and the Fix 3 gain is
-   * proportionally smaller.
+   * This is a single-arm benchmark: run it as-is for the "after" numbers, then
+   * run it again with the pre-Fix-3 ECFileChecksumHelper (which rebuilds the
+   * standalone pipeline for every block instead of caching it per placement
+   * group) for the "before" numbers. The throughput delta between the two runs
+   * is the real effect of Fix 3.
    */
   @Test
   @Timeout(value = 2400, unit = TimeUnit.SECONDS)
   public void runBlockCacheBenchmark() throws Exception {
     System.out.println();
-    System.out.println("=== ECFileChecksum Per-Block Pipeline Cache Benchmark ===");
+    System.out.println("=== ECFileChecksum Multi-Block Checksum Benchmark ===");
     System.out.printf("Workload: %d threads, %ds warmup + %ds measurement%n%n",
         NUM_THREADS, WARMUP_SECS, MEASURE_SECS);
 
@@ -561,26 +549,12 @@ public class FileChecksumBenchmark {
 
       for (int dnLatencyMs : LATENCIES_MS) {
         System.out.printf("DN latency = %dms%n", dnLatencyMs);
-
-        System.out.println("  [A] Fix 1+2 only (no intra-file cache): N buildChecksumPipeline calls/file");
         System.out.println("  " + hdr);
         System.out.println("  " + rule);
         for (int blocksPerFile : BLOCKS_PER_FILE_VARIANTS) {
           int bpf = blocksPerFile;
           BenchmarkResult r = measureBlockCache(blocksPerFile, dnLatencyMs,
-              () -> buildSharedClusterKeyInfoMultiBlock("file", EC15_NODES, ecConfig, bpf, false),
-              blockResponse);
-          printBlockCacheRow(rowFmt, blocksPerFile, r);
-        }
-
-        System.out.println();
-        System.out.println("  [B] Fix 1+2+3 (intra-file cache): 1 buildChecksumPipeline call/file");
-        System.out.println("  " + hdr);
-        System.out.println("  " + rule);
-        for (int blocksPerFile : BLOCKS_PER_FILE_VARIANTS) {
-          int bpf = blocksPerFile;
-          BenchmarkResult r = measureBlockCache(blocksPerFile, dnLatencyMs,
-              () -> buildSharedClusterKeyInfoMultiBlock("file", EC15_NODES, ecConfig, bpf, true),
+              () -> buildSharedClusterKeyInfoMultiBlock("file", EC15_NODES, ecConfig, bpf),
               blockResponse);
           printBlockCacheRow(rowFmt, blocksPerFile, r);
         }
@@ -778,19 +752,11 @@ public class FileChecksumBenchmark {
 
   /**
    * Builds an OmKeyInfo whose EC pipeline has nodes randomly selected from {@code clusterNodes}.
-   *
-   * @param sharedPipelineId  when {@code true} (Scenario B / Fix 1+2+3): all N blocks share one
-   *                          EC pipeline ID, so ECFileChecksumHelper's checksumPipelineCache fires
-   *                          for blocks 2..N → 1 buildChecksumPipeline call per file.
-   *                          When {@code false} (Scenario A / Fix 1+2 only): each block carries a
-   *                          distinct PipelineID.randomId() with the same node set → N cache misses
-   *                          → N buildChecksumPipeline calls per file. Fix 2 still produces the
-   *                          same deterministic standalone pipeline ID from sorted node UUIDs in
-   *                          both cases, so XceiverClient pool reuse is unaffected.
+   * All N blocks of the file share one EC pipeline (same placement group) — the realistic case
+   * that ECFileChecksumHelper's checksumPipelineCache is designed to exploit.
    */
   private static OmKeyInfo buildSharedClusterKeyInfoMultiBlock(String keyName,
-      List<DatanodeDetails> clusterNodes, ECReplicationConfig ecConfig, int nBlocks,
-      boolean sharedPipelineId) {
+      List<DatanodeDetails> clusterNodes, ECReplicationConfig ecConfig, int nBlocks) {
     int nodeCount = ecConfig.getData() + ecConfig.getParity();
     int clusterSize = clusterNodes.size();
     // O(nodeCount) selection without replacement using a small stack-allocated array
@@ -815,8 +781,7 @@ public class FileChecksumBenchmark {
     for (int i = 0; i < selected.size(); i++) {
       replicaIndexes.put(selected.get(i), i + 1);
     }
-    // Build the first (or shared) pipeline once.
-    Pipeline firstPipeline = Pipeline.newBuilder()
+    Pipeline sharedPipeline = Pipeline.newBuilder()
         .setId(PipelineID.randomId())
         .setReplicationConfig(ecConfig)
         .setState(Pipeline.PipelineState.CLOSED)
@@ -825,19 +790,9 @@ public class FileChecksumBenchmark {
         .build();
     List<OmKeyLocationInfo> locs = new ArrayList<>();
     for (int b = 0; b < nBlocks; b++) {
-      // sharedPipelineId=true: reuse firstPipeline for all blocks (Fix 3 fires for blocks 2..N).
-      // sharedPipelineId=false: unique pipeline ID per block, same nodes (Fix 3 always misses).
-      Pipeline blockPipeline = (b == 0 || sharedPipelineId) ? firstPipeline
-          : Pipeline.newBuilder()
-              .setId(PipelineID.randomId())
-              .setReplicationConfig(ecConfig)
-              .setState(Pipeline.PipelineState.CLOSED)
-              .setNodes(selected)
-              .setReplicaIndexes(replicaIndexes)
-              .build();
       locs.add(new OmKeyLocationInfo.Builder()
           .setBlockID(new BlockID(CONTAINER_ID + b, 0))
-          .setPipeline(blockPipeline)
+          .setPipeline(sharedPipeline)
           .setLength(FILE_SIZE)
           .build());
     }
