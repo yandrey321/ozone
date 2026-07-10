@@ -113,7 +113,7 @@ public class FileChecksumBenchmark {
   private static final int WARMUP_SECS = 10;
   private static final int MEASURE_SECS = 20;
   private static final int[] LATENCIES_MS = {0, 5, 10};
-  private static final int[] BLOCKS_PER_FILE_VARIANTS = {1, 2, 3, 5};
+  private static final int[] BLOCKS_PER_FILE_VARIANTS = {1, 3, 5, 10};
   private static final long CONTAINER_ID = 1001L;
   private static final long FILE_SIZE = 5000L;
   // 136 = 4 x 34: every 4th file (idx % 4 == 0) gets a freshly built OmKeyInfo
