@@ -20,6 +20,9 @@ package org.apache.hadoop.hdds.scm.storage;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
@@ -56,11 +59,32 @@ import org.apache.ratis.thirdparty.io.netty.buffer.PooledByteBufAllocator;
  */
 final class BenchmarkMockXceiverClient extends XceiverClientSpi {
 
+  // Simulated datanode/network latency: holds each response ack for this many ms
+  // so in-flight chunk buffers accumulate in the BufferPool (backpressure), the
+  // same way a real datanode round-trip keeps buffers live until commit.
+  private static final long LATENCY_MS = Long.getLong("benchmark.dnLatencyMs", 0L);
+  private static final ScheduledExecutorService DELAY =
+      LATENCY_MS > 0 ? Executors.newScheduledThreadPool(4, r -> {
+        final Thread t = new Thread(r, "mock-dn-latency");
+        t.setDaemon(true);
+        return t;
+      }) : null;
+
   private final Pipeline pipeline;
   private final AtomicLong logIndex = new AtomicLong();
 
   BenchmarkMockXceiverClient(Pipeline pipeline) {
     this.pipeline = pipeline;
+  }
+
+  private <T> CompletableFuture<T> completeMaybeDelayed(T value) {
+    final CompletableFuture<T> future = new CompletableFuture<>();
+    if (DELAY != null) {
+      DELAY.schedule(() -> future.complete(value), LATENCY_MS, TimeUnit.MILLISECONDS);
+    } else {
+      future.complete(value);
+    }
+    return future;
   }
 
   @Override
@@ -111,7 +135,7 @@ final class BenchmarkMockXceiverClient extends XceiverClientSpi {
           .build());
     }
     final XceiverClientReply reply =
-        new XceiverClientReply(CompletableFuture.completedFuture(builder.build()));
+        new XceiverClientReply(completeMaybeDelayed(builder.build()));
     reply.setLogIndex(logIndex.incrementAndGet());
     return reply;
   }
@@ -131,7 +155,7 @@ final class BenchmarkMockXceiverClient extends XceiverClientSpi {
     final XceiverClientReply reply =
         new XceiverClientReply(CompletableFuture.completedFuture(response));
     reply.setLogIndex(index);
-    return CompletableFuture.completedFuture(reply);
+    return completeMaybeDelayed(reply);
   }
 
   @Override
