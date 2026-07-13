@@ -174,29 +174,31 @@ class TestSelectorOutputStream {
   void testFallbackOnStreamNotSupported() throws Exception {
     final int threshold = 10;
     final AtomicBoolean streamingClosed = new AtomicBoolean(false);
-    // Streaming output that cannot stream: always throws on write.
-    final OutputStream streamingOut = new OutputStream() {
-      @Override
-      public void write(int b) throws IOException {
-        throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
-      }
-
-      @Override
-      public void write(byte[] b, int off, int len)
-          throws IOException {
-        throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
-      }
-
-      @Override
-      public void close() {
-        streamingClosed.set(true);
-      }
-    };
     final ByteArrayOutputStream fallbackOut = new ByteArrayOutputStream();
 
+    // The streaming selection cannot stream: it always throws on write and
+    // records that it was closed. Created inside the selector so it is owned
+    // (and closed) by the SelectorOutputStream under test.
     final CheckedFunction<Integer, OutputStream, IOException> selector =
         byteWritten -> byteWritten <= threshold
-            ? new ByteArrayOutputStream() : streamingOut;
+            ? new ByteArrayOutputStream()
+            : new OutputStream() {
+              @Override
+              public void write(int b) throws IOException {
+                throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
+              }
+
+              @Override
+              public void write(byte[] b, int off, int len)
+                  throws IOException {
+                throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
+              }
+
+              @Override
+              public void close() {
+                streamingClosed.set(true);
+              }
+            };
     final CheckedFunction<Integer, OutputStream, IOException> fallbackSelector =
         byteWritten -> fallbackOut;
 
@@ -237,11 +239,21 @@ class TestSelectorOutputStream {
         };
     final SelectorOutputStream<OutputStream> out =
         new SelectorOutputStream<>(threshold, selector);
-    assertThrows(StreamNotSupportedException.class, () -> {
-      for (int i = 0; i < threshold + 5; i++) {
-        out.write(i);
+    try {
+      assertThrows(StreamNotSupportedException.class, () -> {
+        for (int i = 0; i < threshold + 5; i++) {
+          out.write(i);
+        }
+      });
+    } finally {
+      // The selector always throws, so close() cannot flush the buffer either;
+      // release it quietly.
+      try {
+        out.close();
+      } catch (IOException ignored) {
+        // expected: the underlying selection fails by design
       }
-    });
+    }
   }
 
   /**
@@ -305,26 +317,28 @@ class TestSelectorOutputStream {
   @Test
   void testArrayWriteFallbackWithFailingClose() throws Exception {
     final int threshold = 10;
-    final OutputStream streamingOut = new OutputStream() {
-      @Override
-      public void write(int b) throws IOException {
-        throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
-      }
-
-      @Override
-      public void write(byte[] b, int off, int len) throws IOException {
-        throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
-      }
-
-      @Override
-      public void close() throws IOException {
-        throw new IOException("close failed");
-      }
-    };
     final ByteArrayOutputStream fallbackOut = new ByteArrayOutputStream();
+    // The streaming selection both throws on write and fails to close; created
+    // inside the selector so it is owned (and closed) by the stream under test.
     final CheckedFunction<Integer, OutputStream, IOException> selector =
         byteWritten -> byteWritten <= threshold
-            ? new ByteArrayOutputStream() : streamingOut;
+            ? new ByteArrayOutputStream()
+            : new OutputStream() {
+              @Override
+              public void write(int b) throws IOException {
+                throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
+              }
+
+              @Override
+              public void write(byte[] b, int off, int len) throws IOException {
+                throw new StreamNotSupportedException("no RATIS_DATASTREAM port");
+              }
+
+              @Override
+              public void close() throws IOException {
+                throw new IOException("close failed");
+              }
+            };
     final CheckedFunction<Integer, OutputStream, IOException> fallbackSelector =
         byteWritten -> fallbackOut;
 
@@ -365,7 +379,17 @@ class TestSelectorOutputStream {
         new SelectorOutputStream<>(threshold, byteWritten -> {
           throw new IOException("cannot select");
         });
-    assertFalse(failing.hasCapability("hsync"));
+    try {
+      assertFalse(failing.hasCapability("hsync"));
+    } finally {
+      // Selection always throws, so nothing is opened and close() rethrows it;
+      // release it quietly.
+      try {
+        failing.close();
+      } catch (IOException ignored) {
+        // expected: the underlying selection fails by design
+      }
+    }
   }
 
   private static byte[] newData(int length) {
