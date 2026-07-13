@@ -182,13 +182,9 @@ public class PipelineManagerImpl implements PipelineManager {
             .setServiceName("BackgroundPipelineScrubber")
             .setIntervalInMillis(scrubberIntervalInMillis)
             .setWaitTimeInMillis(safeModeWaitMs)
-            .setPeriodicalTask(() -> {
-              try {
-                pipelineManager.scrubPipelines();
-              } catch (IOException e) {
-                LOG.error("Unexpected error during pipeline scrubbing", e);
-              }
-            }).build();
+            .setPeriodicalTask(
+                pipelineManager::scrubAndCloseNonStreamablePipelines)
+            .build();
 
     pipelineManager.setBackgroundPipelineScrubber(backgroundPipelineScrubber);
     serviceManager.register(backgroundPipelineScrubber);
@@ -560,6 +556,68 @@ public class PipelineManagerImpl implements PipelineManager {
     return left.getID().equals(right.getID())
         && (!left.getIpAddress().equals(right.getIpAddress())
         ||  !left.getHostName().equals(right.getHostName()));
+  }
+
+  /**
+   * Close (and delete) OPEN pipelines that predate a datanode capability the
+   * registered node now advertises but the pipeline's stored node snapshot
+   * lacks — in practice the RATIS_DATASTREAM port after Ratis DataStream was
+   * enabled. Such pipelines cannot serve streaming even after the datanodes
+   * restart, because the Raft group's persisted configuration still carries the
+   * stale datastream address; only a freshly created pipeline is
+   * streaming-capable. BackgroundPipelineCreator recreates replacements from
+   * the now-capable nodes (HDDS-12991).
+   */
+  void scrubAndCloseNonStreamablePipelines() {
+    try {
+      scrubPipelines();
+    } catch (IOException e) {
+      LOG.error("Unexpected error during pipeline scrubbing", e);
+    }
+    closeNonStreamablePipelines();
+  }
+
+  @Override
+  public void closeNonStreamablePipelines() {
+    for (Pipeline pipeline : getPipelines()) {
+      if (!pipeline.isOpen() || !nodesExposeNewPorts(pipeline)) {
+        continue;
+      }
+      try {
+        final PipelineID id = pipeline.getId();
+        LOG.info("Closing non-streamable pipeline {} so a streaming-capable "
+            + "pipeline can replace it", id);
+        closePipeline(id);
+        deletePipeline(id);
+      } catch (IOException e) {
+        LOG.error("Failed to close non-streamable pipeline {}",
+            pipeline.getId(), e);
+      }
+    }
+  }
+
+  /**
+   * Whether any registered node of the pipeline exposes a port name that the
+   * pipeline's stored copy of that node lacks (e.g. RATIS_DATASTREAM added
+   * after the pipeline was created).
+   */
+  private boolean nodesExposeNewPorts(Pipeline pipeline) {
+    for (DatanodeDetails stored : pipeline.getNodes()) {
+      final DatanodeDetails current = nodeManager.getNode(stored.getID());
+      if (current != null && exposesNewPorts(stored, current)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static boolean exposesNewPorts(DatanodeDetails stored,
+      DatanodeDetails current) {
+    final Set<DatanodeDetails.Port.Name> storedNames = stored.getPorts().stream()
+        .map(DatanodeDetails.Port::getName).collect(Collectors.toSet());
+    return current.getPorts().stream()
+        .map(DatanodeDetails.Port::getName)
+        .anyMatch(name -> !storedNames.contains(name));
   }
 
   /**

@@ -117,6 +117,15 @@ public interface PipelineManager extends Closeable, PipelineManagerMXBean {
 
   void closeStalePipelines(DatanodeDetails datanodeDetails);
 
+  /**
+   * Close OPEN pipelines whose datanodes now expose a port (the
+   * RATIS_DATASTREAM port after Ratis DataStream was enabled) that the
+   * pipeline's stored node snapshot lacks, so streaming-capable pipelines are
+   * created in their place. A pre-datastream Raft group cannot be made
+   * streamable in place, so it must be recreated (HDDS-12991).
+   */
+  void closeNonStreamablePipelines();
+
   void scrubPipelines() throws IOException;
 
   void startPipelineCreator();

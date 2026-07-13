@@ -250,6 +250,11 @@ public class MockPipelineManager implements PipelineManager {
   }
 
   @Override
+  public void closeNonStreamablePipelines() {
+
+  }
+
+  @Override
   public void scrubPipelines() {
 
   }
