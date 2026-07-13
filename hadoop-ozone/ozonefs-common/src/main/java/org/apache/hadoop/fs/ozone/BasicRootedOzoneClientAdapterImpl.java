@@ -667,6 +667,12 @@ public class BasicRootedOzoneClientAdapterImpl
   @Override
   public FileStatusAdapter getFileStatus(String path, URI uri,
       Path qualifiedPath, String userName) throws IOException {
+    return getFileStatus(path, uri, qualifiedPath, userName, false);
+  }
+
+  @Override
+  public FileStatusAdapter getFileStatus(String path, URI uri,
+      Path qualifiedPath, String userName, boolean headOp) throws IOException {
     incrementCounter(Statistic.OBJECTS_QUERY, 1);
     OFSPath ofsPath = new OFSPath(path, config);
     if (ofsPath.isRoot()) {
@@ -676,7 +682,7 @@ public class BasicRootedOzoneClientAdapterImpl
       return getFileStatusAdapterForVolume(volume, uri);
     } else {
       return getFileStatusForKeyOrSnapshot(
-          ofsPath, uri, qualifiedPath, userName);
+          ofsPath, uri, qualifiedPath, userName, headOp);
     }
   }
 
@@ -686,8 +692,8 @@ public class BasicRootedOzoneClientAdapterImpl
    * Throws exception in case of failure.
    */
   private FileStatusAdapter getFileStatusForKeyOrSnapshot(
-      OFSPath ofsPath, URI uri, Path qualifiedPath, String userName)
-      throws IOException {
+      OFSPath ofsPath, URI uri, Path qualifiedPath, String userName,
+      boolean headOp) throws IOException {
     String key = ofsPath.getKeyName();
     try {
       OzoneBucket bucket = getBucket(ofsPath, false);
@@ -696,7 +702,7 @@ public class BasicRootedOzoneClientAdapterImpl
         return getFileStatusAdapterWithSnapshotIndicator(
             volume, bucket, uri);
       } else {
-        OzoneFileStatus status = bucket.getFileStatus(key);
+        OzoneFileStatus status = bucket.getFileStatus(key, headOp);
         return toFileStatusAdapter(status, userName, uri, qualifiedPath,
             ofsPath.getNonKeyPath());
       }

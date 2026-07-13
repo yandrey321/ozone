@@ -555,6 +555,30 @@ abstract class AbstractRootedOzoneFileSystemTest extends OzoneFileSystemTestBase
   }
 
   /**
+   * OFS: isFile/isDirectory are metadata-only (headOp) checks. They must report
+   * the correct entry type for files, directories and non-existent paths
+   * (HDDS-15678).
+   */
+  @Test
+  void testIsFileAndIsDirectory() throws Exception {
+    Path dir = new Path(bucketPath, "isdir-dir");
+    fs.mkdirs(dir);
+    Path file = new Path(dir, "isdir-file");
+    ContractTestUtils.touch(fs, file);
+
+    assertTrue(fs.isDirectory(dir));
+    assertFalse(fs.isFile(dir));
+    assertTrue(fs.isFile(file));
+    assertFalse(fs.isDirectory(file));
+
+    Path missing = new Path(dir, "does-not-exist");
+    assertFalse(fs.isDirectory(missing));
+    assertFalse(fs.isFile(missing));
+
+    fs.delete(dir, true);
+  }
+
+  /**
    * Test listStatus operation in a bucket.
    */
   @Test

@@ -978,6 +978,26 @@ public interface ClientProtocol {
       String keyName) throws IOException;
 
   /**
+   * Get the Ozone File Status for a particular Ozone key.
+   *
+   * @param volumeName volume name.
+   * @param bucketName bucket name.
+   * @param keyName    key name.
+   * @param headOp     when true, this is a metadata-only (type) check: the OM
+   *                   skips the pipeline refresh (SCM round-trip) and datanode
+   *                   sorting since block locations are not needed.
+   * @return OzoneFileStatus for the key.
+   * @throws OMException if file does not exist
+   *                     if bucket does not exist
+   * @throws IOException if there is error in the db
+   *                     invalid arguments
+   */
+  default OzoneFileStatus getOzoneFileStatus(String volumeName,
+      String bucketName, String keyName, boolean headOp) throws IOException {
+    return getOzoneFileStatus(volumeName, bucketName, keyName);
+  }
+
+  /**
    * Creates directory with keyName as the absolute path for the directory.
    *
    * @param volumeName Volume name
