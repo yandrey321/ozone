@@ -312,8 +312,13 @@ public class BasicOzoneFileSystem extends FileSystem {
       final CheckedFunction<Integer, OutputStream, IOException> selector
           = byteWritten -> selectOutputStream(
           key, replication, overwrite, recursive, byteWritten);
+      // Fallback used when the streaming output cannot be used for the target
+      // pipeline (no RATIS_DATASTREAM port): write via the non-streaming path.
+      final CheckedFunction<Integer, OutputStream, IOException> fallback
+          = byteWritten -> createFSOutputStream(adapter.createFile(
+          key, replication, overwrite, recursive));
       return new FSDataOutputStream(new SelectorOutputStream<>(
-          streamingAutoThreshold, selector), statistics);
+          streamingAutoThreshold, selector, fallback), statistics);
     }
 
     return new FSDataOutputStream(createFSOutputStream(

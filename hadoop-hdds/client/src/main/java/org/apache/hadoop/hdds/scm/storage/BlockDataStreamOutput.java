@@ -196,7 +196,8 @@ public class BlockDataStreamOutput implements ByteBufferStreamOutput {
   private DataStreamOutput setupStream(Pipeline pipeline) throws IOException {
     for (DatanodeDetails dn : pipeline.getNodes()) {
       if (!dn.hasPort(DatanodeDetails.Port.Name.RATIS_DATASTREAM)) {
-        throw new IOException("RATIS_DATASTREAM port is missing for datanode "
+        throw new StreamNotSupportedException(
+            "RATIS_DATASTREAM port is missing for datanode "
             + dn + " in pipeline " + pipeline.getId()
             + "; datastream is disabled for this pipeline");
       }

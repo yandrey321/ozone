@@ -23,7 +23,11 @@ import java.io.OutputStream;
 import java.util.Objects;
 import org.apache.hadoop.fs.StreamCapabilities;
 import org.apache.hadoop.fs.Syncable;
+import org.apache.hadoop.hdds.scm.storage.StreamNotSupportedException;
+import org.apache.ratis.util.function.CheckedConsumer;
 import org.apache.ratis.util.function.CheckedFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * An {@link OutputStream} first write data to a buffer up to the capacity.
@@ -38,6 +42,9 @@ import org.apache.ratis.util.function.CheckedFunction;
  */
 public class SelectorOutputStream<OUT extends OutputStream>
     extends OutputStream implements Syncable, StreamCapabilities {
+
+  private static final Logger LOG =
+      LoggerFactory.getLogger(SelectorOutputStream.class);
 
   private final ByteArrayBuffer buffer;
   private final Underlying underlying;
@@ -78,19 +85,26 @@ public class SelectorOutputStream<OUT extends OutputStream>
       offset += length;
     }
 
-    <OUT extends OutputStream> OUT selectAndClose(
-        int outstandingBytes, boolean force,
-        CheckedFunction<Integer, OUT, IOException> selector)
-        throws IOException {
+    /** Whether an {@link OutputStream} must be selected to hold the bytes. */
+    boolean requiresSelection(int outstandingBytes, boolean force) {
       assertRemaining(0);
-      final int required = offset + outstandingBytes;
-      if (force || required > array.length) {
-        final OUT out = selector.apply(required);
+      return force || offset + outstandingBytes > array.length;
+    }
+
+    /** The total number of bytes the selected stream must accept. */
+    int required(int outstandingBytes) {
+      return offset + outstandingBytes;
+    }
+
+    /** Write the buffered bytes to {@code out}; the buffer is not released. */
+    void writePrefixTo(OutputStream out) throws IOException {
+      if (offset > 0) {
         out.write(array, 0, offset);
-        array = null;
-        return out;
       }
-      return null;
+    }
+
+    void release() {
+      array = null;
     }
   }
 
@@ -98,17 +112,74 @@ public class SelectorOutputStream<OUT extends OutputStream>
   final class Underlying {
     /** Select an {@link OutputStream} by the number of bytes. */
     private final CheckedFunction<Integer, OUT, IOException> selector;
+    /** Selector used when the primary selection cannot stream; may be null. */
+    private final CheckedFunction<Integer, OUT, IOException> fallbackSelector;
     private OUT out;
+    /** No byte has been accepted by {@link #out} yet, so the buffered prefix is
+     * still intact and a {@link StreamNotSupportedException} can be recovered
+     * by switching to the fallback (non-streaming) output. */
+    private boolean started = false;
 
-    private Underlying(CheckedFunction<Integer, OUT, IOException> selector) {
+    private Underlying(CheckedFunction<Integer, OUT, IOException> selector,
+        CheckedFunction<Integer, OUT, IOException> fallbackSelector) {
       this.selector = selector;
+      this.fallbackSelector = fallbackSelector;
     }
 
+    /** Select an {@link OutputStream} if the buffer must be flushed. */
     private OUT select(int outstandingBytes, boolean force) throws IOException {
-      if (out == null) {
-        out = buffer.selectAndClose(outstandingBytes, force, selector);
+      if (out == null && buffer.requiresSelection(outstandingBytes, force)) {
+        out = selector.apply(buffer.required(outstandingBytes));
       }
       return out;
+    }
+
+    /**
+     * Flush the buffered prefix and the given payload to the selected stream.
+     * On the first flush, a {@link StreamNotSupportedException} (e.g. the chosen
+     * streaming output cannot be used because the pipeline lacks the
+     * RATIS_DATASTREAM port) is recovered by switching to the non-streaming
+     * fallback and replaying the buffered prefix and the payload. Once the
+     * first flush succeeds, the buffer is released and later writes go directly
+     * to the selected stream.
+     */
+    private void firstFlush(CheckedConsumer<OUT, IOException> payload)
+        throws IOException {
+      try {
+        buffer.writePrefixTo(out);
+        payload.accept(out);
+      } catch (StreamNotSupportedException e) {
+        if (fallbackSelector == null) {
+          throw e;
+        }
+        // The selected (streaming) output cannot be used for this pipeline
+        // (e.g. datanodes without the RATIS_DATASTREAM port). Fall back to the
+        // non-streaming output; the buffered prefix is still intact.
+        LOG.warn("Streaming output is not supported for this write; "
+            + "falling back to the non-streaming output stream.", e);
+        try {
+          out.close();
+        } catch (IOException closeFailure) {
+          // The StreamNotSupportedException is recovered (not rethrown), so a
+          // failure closing the discarded streaming output would be lost if
+          // only attached as suppressed. Log it here so it is surfaced.
+          LOG.warn("Failed to close the unsupported streaming output while "
+              + "falling back to the non-streaming output stream.", closeFailure);
+        }
+        out = fallbackSelector.apply(buffer.required(0));
+        buffer.writePrefixTo(out);
+        payload.accept(out);
+      }
+      started = true;
+      buffer.release();
+    }
+
+    /** Ensure the buffered prefix has been flushed to the selected stream.
+     * The caller selects with {@code force}, so {@link #out} is already set. */
+    private void ensureStarted() throws IOException {
+      if (!started) {
+        firstFlush(ignored -> { });
+      }
     }
   }
 
@@ -121,8 +192,24 @@ public class SelectorOutputStream<OUT extends OutputStream>
    */
   public SelectorOutputStream(int selectionThreshold,
       CheckedFunction<Integer, OUT, IOException> selector) {
+    this(selectionThreshold, selector, null);
+  }
+
+  /**
+   * Same as {@link #SelectorOutputStream(int, CheckedFunction)} but with a
+   * fallback selector used when the primary selection throws
+   * {@link StreamNotSupportedException} (e.g. the chosen streaming output cannot
+   * be used because the pipeline lacks the RATIS_DATASTREAM port). The buffered
+   * data is re-written to the fallback stream.
+   *
+   * @param fallbackSelector produces the non-streaming output; {@code null}
+   *                         disables the fallback (original behavior).
+   */
+  public SelectorOutputStream(int selectionThreshold,
+      CheckedFunction<Integer, OUT, IOException> selector,
+      CheckedFunction<Integer, OUT, IOException> fallbackSelector) {
     this.buffer = new ByteArrayBuffer(selectionThreshold);
-    this.underlying = new Underlying(selector);
+    this.underlying = new Underlying(selector, fallbackSelector);
   }
 
   public OUT getUnderlying() {
@@ -132,26 +219,32 @@ public class SelectorOutputStream<OUT extends OutputStream>
   @Override
   public void write(int b) throws IOException {
     final OUT out = underlying.select(1, false);
-    if (out != null) {
-      out.write(b);
-    } else {
+    if (out == null) {
       buffer.write((byte) b);
+    } else if (!underlying.started) {
+      underlying.firstFlush(o -> o.write(b));
+    } else {
+      out.write(b);
     }
   }
 
   @Override
   public void write(@Nonnull byte[] array, int off, int len)
       throws IOException {
-    final OUT selected = underlying.select(len, false);
-    if (selected != null) {
-      selected.write(array, off, len);
-    } else {
+    final OUT out = underlying.select(len, false);
+    if (out == null) {
       buffer.write(array, off, len);
+    } else if (!underlying.started) {
+      underlying.firstFlush(o -> o.write(array, off, len));
+    } else {
+      out.write(array, off, len);
     }
   }
 
   private OUT select() throws IOException {
-    return underlying.select(0, true);
+    final OUT out = underlying.select(0, true);
+    underlying.ensureStarted();
+    return out;
   }
 
   @Override

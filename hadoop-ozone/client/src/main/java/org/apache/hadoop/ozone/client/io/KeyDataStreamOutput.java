@@ -40,6 +40,7 @@ import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdds.scm.storage.AbstractDataStreamOutput;
 import org.apache.hadoop.hdds.scm.storage.BlockDataStreamOutput;
+import org.apache.hadoop.hdds.scm.storage.StreamNotSupportedException;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfoGroup;
@@ -207,6 +208,12 @@ public class KeyDataStreamOutput extends AbstractDataStreamOutput
         }
         len -= writtenLength;
         off += writtenLength;
+      } catch (StreamNotSupportedException e) {
+        // The pipeline cannot stream (e.g. datanodes created before DataStream
+        // was enabled). Surface it as-is so callers can fall back to the
+        // non-streaming write path (HDDS-12991).
+        markStreamClosed();
+        throw e;
       } catch (Exception e) {
         markStreamClosed();
         throw new IOException(e);
