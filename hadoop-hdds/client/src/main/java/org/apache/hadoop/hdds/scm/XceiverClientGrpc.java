@@ -256,7 +256,7 @@ public class XceiverClientGrpc extends XceiverClientSpi {
   /**
    * Closes all the communication channels of the client one-by-one.
    * When a channel is closed, no further requests can be sent via the channel,
-   * and the method waits to finish all ongoing communication.
+   * and any in-flight RPCs are cancelled immediately (shutdownNow semantics).
    */
   @Override
   public void close() {
