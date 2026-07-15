@@ -55,16 +55,18 @@ public class TestOzoneBucket {
   }
 
   /**
-   * The ClientProtocol headOp overload has a default that delegates to the
-   * 3-arg method (used by implementations that do not honor headOp).
+   * The 3-arg convenience method has a default that delegates to the
+   * headOp-aware overload with headOp=false, so implementations only need to
+   * provide the headOp-aware method and can never silently ignore the flag.
    */
   @Test
-  public void clientProtocolHeadOpDefaultDelegates() throws IOException {
+  public void clientProtocol3argDefaultDelegates() throws IOException {
     ClientProtocol proxy = mock(ClientProtocol.class, CALLS_REAL_METHODS);
     OzoneFileStatus status = mock(OzoneFileStatus.class);
-    doReturn(status).when(proxy).getOzoneFileStatus("vol", "bucket", "key");
+    doReturn(status).when(proxy)
+        .getOzoneFileStatus("vol", "bucket", "key", false);
 
-    assertSame(status, proxy.getOzoneFileStatus("vol", "bucket", "key", true));
-    verify(proxy).getOzoneFileStatus("vol", "bucket", "key");
+    assertSame(status, proxy.getOzoneFileStatus("vol", "bucket", "key"));
+    verify(proxy).getOzoneFileStatus("vol", "bucket", "key", false);
   }
 }

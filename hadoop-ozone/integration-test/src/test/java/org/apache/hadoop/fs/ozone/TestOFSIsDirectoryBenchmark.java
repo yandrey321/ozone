@@ -53,9 +53,13 @@ import org.junit.jupiter.api.Timeout;
  * {@code isDirectory}/{@code isFile} overrides in
  * {@link BasicRootedOzoneFileSystem} and compare the HEAD numbers.
  *
+ * <p>The {@code benchmark} tag is excluded from {@code mvn test} and CI by
+ * default, so it must be re-enabled explicitly to run on demand:
+ *
  * <pre>
  *   mvn -pl hadoop-ozone/integration-test test \
- *     -Dtest=TestOFSIsDirectoryBenchmark -DskipShade -DskipRecon \
+ *     -Dtest=TestOFSIsDirectoryBenchmark -Dgroups=benchmark \
+ *     -Dexcluded-test-groups= -DskipShade -DskipRecon \
  *     -Dsurefire.failIfNoSpecifiedTests=false
  * </pre>
  */

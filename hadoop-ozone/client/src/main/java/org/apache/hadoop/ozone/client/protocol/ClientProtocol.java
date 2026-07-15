@@ -974,8 +974,10 @@ public interface ClientProtocol {
    * @throws IOException if there is error in the db
    *                     invalid arguments
    */
-  OzoneFileStatus getOzoneFileStatus(String volumeName, String bucketName,
-      String keyName) throws IOException;
+  default OzoneFileStatus getOzoneFileStatus(String volumeName,
+      String bucketName, String keyName) throws IOException {
+    return getOzoneFileStatus(volumeName, bucketName, keyName, false);
+  }
 
   /**
    * Get the Ozone File Status for a particular Ozone key.
@@ -992,10 +994,8 @@ public interface ClientProtocol {
    * @throws IOException if there is error in the db
    *                     invalid arguments
    */
-  default OzoneFileStatus getOzoneFileStatus(String volumeName,
-      String bucketName, String keyName, boolean headOp) throws IOException {
-    return getOzoneFileStatus(volumeName, bucketName, keyName);
-  }
+  OzoneFileStatus getOzoneFileStatus(String volumeName, String bucketName,
+      String keyName, boolean headOp) throws IOException;
 
   /**
    * Creates directory with keyName as the absolute path for the directory.

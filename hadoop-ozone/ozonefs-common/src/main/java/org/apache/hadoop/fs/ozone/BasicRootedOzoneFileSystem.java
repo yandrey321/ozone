@@ -1171,22 +1171,28 @@ public class BasicRootedOzoneFileSystem extends FileSystem {
   }
 
   @Override
+  @SuppressWarnings("deprecation")
   public boolean isDirectory(Path f) throws IOException {
     incrementCounter(Statistic.INVOCATION_IS_DIRECTORY);
     try {
       // headOp: only the entry type is needed, so skip the pipeline refresh.
-      return convertFileStatus(getFileStatusAdapter(f, true)).isDirectory();
+      // Read the type straight off the adapter to avoid the extra work of
+      // building a Hadoop FileStatus.
+      return getFileStatusAdapter(f, true).isDir();
     } catch (FileNotFoundException e) {
       return false;
     }
   }
 
   @Override
+  @SuppressWarnings("deprecation")
   public boolean isFile(Path f) throws IOException {
     incrementCounter(Statistic.INVOCATION_IS_FILE);
     try {
       // headOp: only the entry type is needed, so skip the pipeline refresh.
-      return convertFileStatus(getFileStatusAdapter(f, true)).isFile();
+      // Read the type straight off the adapter to avoid the extra work of
+      // building a Hadoop FileStatus.
+      return getFileStatusAdapter(f, true).isFile();
     } catch (FileNotFoundException e) {
       return false;
     }

@@ -97,7 +97,9 @@ public class TestRootedOzoneFileSystemHeadOp {
     verify(adapter, org.mockito.Mockito.atLeastOnce()).getFileStatus(
         anyString(), any(URI.class), any(Path.class), anyString(),
         headOp.capture());
-    assertTrue(headOp.getValue(), "isDirectory/isFile must request headOp");
+    for (Boolean v : headOp.getAllValues()) {
+      assertTrue(v, "isDirectory/isFile must request headOp");
+    }
   }
 
   @Test
