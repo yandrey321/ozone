@@ -231,6 +231,12 @@ public class KeyDataStreamOutput extends AbstractDataStreamOutput
         current.write(b, off, writeLen);
         offset += writeLen;
       }
+    } catch (StreamNotSupportedException e) {
+      // The pipeline cannot stream (datanodes lack the RATIS_DATASTREAM port).
+      // Surface it immediately instead of routing through handleException(),
+      // whose retries would each hit the same missing port and only delay the
+      // caller's fall back to the non-streaming write path (HDDS-12991).
+      throw e;
     } catch (IOException ioe) {
       // for the current iteration, totalDataWritten - currentPos gives the
       // amount of data already written to the buffer
