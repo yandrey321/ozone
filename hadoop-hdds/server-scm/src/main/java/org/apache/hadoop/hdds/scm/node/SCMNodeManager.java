@@ -474,6 +474,14 @@ public class SCMNodeManager implements NodeManager, ContainerReplicaPendingOpsSu
               "oldVersion = {}, newVersion = {}.",
               datanodeDetails, oldNode.getVersion(), datanodeDetails.getVersion());
           nodeStateManager.updateNode(datanodeDetails, layoutInfo);
+        } else if (portsChanged(oldNode, datanodeDetails)) {
+          // Refresh the stored node when its port set changes (e.g. a datanode
+          // restarts with Ratis DataStream enabled and now exposes the
+          // RATIS_DATASTREAM port). Otherwise the stale record would keep
+          // streaming clients from reaching the datastream port (HDDS-15799).
+          LOG.info("Updating ports for registered datanode {}: {} -> {}",
+              datanodeDetails, oldNode.getPorts(), datanodeDetails.getPorts());
+          nodeStateManager.updateNode(datanodeDetails, layoutInfo);
         }
       } catch (NodeNotFoundException e) {
         LOG.error("Cannot find datanode {} from nodeStateManager",
@@ -485,6 +493,22 @@ public class SCMNodeManager implements NodeManager, ContainerReplicaPendingOpsSu
         .setDatanode(datanodeDetails)
         .setClusterID(this.scmStorageConfig.getClusterID())
         .build();
+  }
+
+  /**
+   * Whether the datanode's exposed ports changed between two registrations.
+   * Compared as a set of name=value entries, since
+   * {@link DatanodeDetails.Port#equals} ignores the port value.
+   */
+  private static boolean portsChanged(DatanodeDetails oldNode,
+      DatanodeDetails newNode) {
+    return !portValues(oldNode).equals(portValues(newNode));
+  }
+
+  private static Set<String> portValues(DatanodeDetails datanodeDetails) {
+    return datanodeDetails.getPorts().stream()
+        .map(port -> port.getName() + "=" + port.getValue())
+        .collect(Collectors.toSet());
   }
 
   /**
