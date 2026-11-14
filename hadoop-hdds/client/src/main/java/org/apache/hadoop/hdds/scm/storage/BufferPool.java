@@ -159,17 +159,39 @@ public class BufferPool {
     }
   }
 
+  /**
+   * Close all the buffers and empty this pool. A buffer that fails to close does not stop the others from closing;
+   * the first failure is thrown, with any later ones suppressed.
+   */
   public void clearBufferPool() {
     lock.lock();
     try {
-      allocated.forEach(ChunkBuffer::close);
-      released.forEach(ChunkBuffer::close);
+      RuntimeException failure = closeAll(allocated, null);
+      failure = closeAll(released, failure);
       allocated.clear();
       released.clear();
       currentBuffer = null;
+      if (failure != null) {
+        throw failure;
+      }
     } finally {
       lock.unlock();
     }
+  }
+
+  private static RuntimeException closeAll(List<ChunkBuffer> buffers, RuntimeException failure) {
+    for (ChunkBuffer buffer : buffers) {
+      try {
+        buffer.close();
+      } catch (RuntimeException e) {
+        if (failure == null) {
+          failure = e;
+        } else {
+          failure.addSuppressed(e);
+        }
+      }
+    }
+    return failure;
   }
 
   public long computeBufferData() {

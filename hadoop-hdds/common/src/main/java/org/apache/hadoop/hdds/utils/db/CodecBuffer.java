@@ -309,8 +309,11 @@ public class CodecBuffer implements UncheckedAutoCloseable {
       // Allow a zero capacity buffer to be released multiple times.
       Preconditions.assertSame(0, buf.capacity(), "capacity");
     }
+    // Read the count before releasing: once the last reference is released, the pool may already have handed the
+    // same ByteBuf object to another thread, so its refCnt() no longer describes this buffer.
+    final int refCnt = buf.refCnt();
     if (buf.release()) {
-      assertRefCnt(0);
+      Preconditions.assertSame(1, refCnt, "refCnt");
     } else {
       // A zero capacity buffer, possibly singleton, may not be able released.
       Preconditions.assertSame(0, buf.capacity(), "capacity");
