@@ -33,6 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.any;
 
 import com.google.common.base.Functions;
@@ -218,7 +219,8 @@ class TestContainerReplication {
 
   private void mockContainerProtocolCalls(final MockedStatic<ContainerProtocolCalls> mockedContainerProtocolCalls,
                                           final Map<Integer, Integer> failedReadChunkCountMap) {
-    mockedContainerProtocolCalls.when(() -> ContainerProtocolCalls.readChunk(any(), any(), any(), anyList(), any()))
+    mockedContainerProtocolCalls.when(() ->
+            ContainerProtocolCalls.readChunk(any(), any(), any(), anyList(), nullable(String.class)))
         .thenAnswer(invocation -> {
           int replicaIndex = ((ContainerProtos.DatanodeBlockID) invocation.getArgument(2)).getReplicaIndex();
           try {

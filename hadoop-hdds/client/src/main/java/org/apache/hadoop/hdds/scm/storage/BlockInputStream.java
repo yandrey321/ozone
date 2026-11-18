@@ -64,8 +64,10 @@ public class BlockInputStream extends BlockExtendedInputStream {
   private final BlockLocationInfo blockInfo;
   private final AtomicReference<Pipeline> pipelineRef =
       new AtomicReference<>();
-  private final AtomicReference<Token<OzoneBlockTokenIdentifier>> tokenRef =
-      new AtomicReference<>();
+  // The token given to the constructor, until the first request encodes it (see ensureTokenEncoded).
+  private final AtomicReference<Token<OzoneBlockTokenIdentifier>> pendingTokenRef = new AtomicReference<>();
+  // The block token, encoded once and reused by every request for this block.
+  private final AtomicReference<String> encodedTokenRef = new AtomicReference<>();
   private final boolean verifyChecksum;
   private XceiverClientFactory xceiverClientFactory;
   private XceiverClientSpi xceiverClientGrpc;
@@ -122,7 +124,7 @@ public class BlockInputStream extends BlockExtendedInputStream {
     this.blockID = blockInfo.getBlockID();
     this.length = blockInfo.getLength();
     pipelineRef.set(setPipeline(pipeline));
-    tokenRef.set(token);
+    pendingTokenRef.set(token);
     this.verifyChecksum = config.isChecksumVerify();
     this.xceiverClientFactory = xceiverClientFactory;
     this.refreshFunction = refreshFunction;
@@ -141,6 +143,8 @@ public class BlockInputStream extends BlockExtendedInputStream {
     }
     // A closed stream has no client to get the block with.
     checkOpen();
+    // Every request for the block is sent by or after initialize().
+    ensureTokenEncoded();
 
     List<ChunkInfo> chunks = null;
     IOException catchEx = null;
@@ -204,7 +208,14 @@ public class BlockInputStream extends BlockExtendedInputStream {
   }
 
   private synchronized void refreshBlockInfo(IOException cause) throws IOException {
-    refreshBlockInfo(cause, blockID, pipelineRef, tokenRef, refreshFunction);
+    // so that the token from the constructor can never overwrite the refreshed one
+    ensureTokenEncoded();
+    refreshBlockInfo(cause, blockID, pipelineRef, encodedTokenRef, refreshFunction);
+  }
+
+  /** Encode the block token before the first request for this block. */
+  private synchronized void ensureTokenEncoded() throws IOException {
+    encodePendingToken(pendingTokenRef, encodedTokenRef);
   }
 
   /**
@@ -244,7 +255,7 @@ public class BlockInputStream extends BlockExtendedInputStream {
         acquireClient();
       }
     }
-    return getBlockDataUsingGRPCClient(xceiverClientGrpc, pipelineRef.get(), tokenRef.get());
+    return getBlockDataUsingGRPCClient(xceiverClientGrpc, pipelineRef.get(), encodedTokenRef.get());
   }
 
   @VisibleForTesting
@@ -267,8 +278,9 @@ public class BlockInputStream extends BlockExtendedInputStream {
             .setGetBlock(getBlockRequest)
             .setClientId(xceiverClientShortCircuit.getClientId())
             .setCallId(xceiverClientShortCircuit.getCallId());
-    if (tokenRef.get() != null) {
-      builder.setEncodedToken(tokenRef.get().encodeToUrlString());
+    final String encodedToken = encodedTokenRef.get();
+    if (encodedToken != null) {
+      builder.setEncodedToken(encodedToken);
     }
     GetBlockResponseProto response = ContainerProtocolCalls.getBlock(xceiverClientShortCircuit,
         VALIDATORS, builder, xceiverClientShortCircuit.getDn());
@@ -332,10 +344,10 @@ public class BlockInputStream extends BlockExtendedInputStream {
     if (blockFileInputStream != null) {
       // a non-empty blockFileInputStream means we have a direct local block replica to read from
       return new LocalChunkInputStream(chunkInfo, blockID, xceiverClientFactory, pipelineRef::get,
-          verifyChecksum, tokenRef::get, xceiverClientShortCircuit, blockFileInputStream.getChannel());
+          verifyChecksum, encodedTokenRef::get, xceiverClientShortCircuit, blockFileInputStream.getChannel());
     } else {
       return new ChunkInputStream(chunkInfo, blockID,
-          xceiverClientFactory, pipelineRef::get, verifyChecksum, tokenRef::get);
+          xceiverClientFactory, pipelineRef::get, verifyChecksum, encodedTokenRef::get);
     }
   }
 

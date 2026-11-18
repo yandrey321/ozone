@@ -193,12 +193,23 @@ public final class ContainerProtocolCalls  {
   public static GetBlockResponseProto getBlock(XceiverClientSpi xceiverClient,
       List<Validator> validators, BlockID blockID, Token<? extends TokenIdentifier> token,
       Pipeline pipeline) throws IOException {
+    return getBlock(xceiverClient, validators, blockID, encode(token), pipeline);
+  }
+
+  /**
+   * Same as {@link #getBlock(XceiverClientSpi, List, BlockID, Token, Pipeline)}, with the token already encoded.
+   *
+   * @param encodedToken the URL-safe encoded token for this block (may be null)
+   */
+  public static GetBlockResponseProto getBlock(XceiverClientSpi xceiverClient,
+      List<Validator> validators, BlockID blockID, String encodedToken,
+      Pipeline pipeline) throws IOException {
     ContainerCommandRequestProto.Builder builder = ContainerCommandRequestProto
         .newBuilder()
         .setCmdType(Type.GetBlock)
         .setContainerID(blockID.getContainerID());
-    if (token != null) {
-      builder.setEncodedToken(token.encodeToUrlString());
+    if (encodedToken != null) {
+      builder.setEncodedToken(encodedToken);
     }
 
     return tryEachDatanode(
@@ -421,6 +432,18 @@ public final class ContainerProtocolCalls  {
       XceiverClientSpi xceiverClient, ChunkInfo chunk, DatanodeBlockID blockID,
       List<Validator> validators,
       Token<? extends TokenIdentifier> token) throws IOException {
+    return readChunk(xceiverClient, chunk, blockID, validators, encode(token));
+  }
+
+  /**
+   * Same as {@link #readChunk(XceiverClientSpi, ChunkInfo, DatanodeBlockID, List, Token)}, with the token already
+   * encoded.
+   *
+   * @param encodedToken the URL-safe encoded token for this block (may be null)
+   */
+  public static ContainerProtos.ReadChunkResponseProto readChunk(
+      XceiverClientSpi xceiverClient, ChunkInfo chunk, DatanodeBlockID blockID,
+      List<Validator> validators, String encodedToken) throws IOException {
     ReadChunkRequestProto.Builder readChunkRequest =
         ReadChunkRequestProto.newBuilder()
             .setBlockID(blockID)
@@ -430,8 +453,8 @@ public final class ContainerProtocolCalls  {
         ContainerCommandRequestProto.newBuilder().setCmdType(Type.ReadChunk)
             .setContainerID(blockID.getContainerID())
             .setReadChunk(readChunkRequest);
-    if (token != null) {
-      builder.setEncodedToken(token.encodeToUrlString());
+    if (encodedToken != null) {
+      builder.setEncodedToken(encodedToken);
     }
 
     try (TracingUtil.TraceCloseable ignored = TracingUtil.createActivatedSpan("readChunk")) {
@@ -964,6 +987,19 @@ public final class ContainerProtocolCalls  {
       BlockID blockID, long offset, long length, int responseDataSize, boolean includeChecksums,
       Token<? extends TokenIdentifier> token, Pipeline pipeline)
       throws IOException {
+    return buildReadBlockCommandProto(blockID, offset, length, responseDataSize, includeChecksums, encode(token),
+        pipeline);
+  }
+
+  /**
+   * Same as {@link #buildReadBlockCommandProto(BlockID, long, long, int, boolean, Token, Pipeline)}, with the token
+   * already encoded.
+   *
+   * @param encodedToken the URL-safe encoded token for this block (may be null)
+   */
+  public static ContainerCommandRequestProto buildReadBlockCommandProto(
+      BlockID blockID, long offset, long length, int responseDataSize, boolean includeChecksums,
+      String encodedToken, Pipeline pipeline) throws IOException {
     final DatanodeDetails datanode = pipeline.getClosestNode();
     final int replicaIndex = pipeline.getReplicaIndex(datanode);
     final ReadBlockRequestProto.Builder readBlockRequest = ReadBlockRequestProto.newBuilder()
@@ -975,12 +1011,16 @@ public final class ContainerProtocolCalls  {
     final ContainerCommandRequestProto.Builder builder =
         ContainerCommandRequestProto.newBuilder().setCmdType(Type.ReadBlock)
             .setContainerID(blockID.getContainerID());
-    if (token != null) {
-      builder.setEncodedToken(token.encodeToUrlString());
+    if (encodedToken != null) {
+      builder.setEncodedToken(encodedToken);
     }
 
     return builder.setDatanodeUuid(datanode.getUuidString())
         .setReadBlock(readBlockRequest)
         .build();
+  }
+
+  private static String encode(Token<? extends TokenIdentifier> token) throws IOException {
+    return token != null ? token.encodeToUrlString() : null;
   }
 }

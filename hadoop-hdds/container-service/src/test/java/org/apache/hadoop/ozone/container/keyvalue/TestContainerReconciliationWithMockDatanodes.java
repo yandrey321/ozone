@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doThrow;
 import  static org.mockito.Mockito.spy;
 
@@ -467,7 +468,8 @@ public class TestContainerReconciliationWithMockDatanodes {
         });
 
     // Mock getBlock
-    containerProtocolMock.when(() -> ContainerProtocolCalls.getBlock(any(), any(), any(), any(), any()))
+    containerProtocolMock.when(() ->
+            ContainerProtocolCalls.getBlock(any(), any(), any(), nullable(String.class), any()))
         .thenAnswer(inv -> {
           XceiverClientSpi xceiverClientSpi = inv.getArgument(0);
           BlockID blockID = inv.getArgument(2);
@@ -483,7 +485,8 @@ public class TestContainerReconciliationWithMockDatanodes {
         });
 
     // Mock readChunk
-    containerProtocolMock.when(() -> ContainerProtocolCalls.readChunk(any(), any(), any(), any(), any()))
+    containerProtocolMock.when(() ->
+            ContainerProtocolCalls.readChunk(any(), any(), any(), any(), nullable(String.class)))
         .thenAnswer(inv -> {
           XceiverClientSpi xceiverClientSpi = inv.getArgument(0);
           ContainerProtos.ChunkInfo chunkInfo = inv.getArgument(1);

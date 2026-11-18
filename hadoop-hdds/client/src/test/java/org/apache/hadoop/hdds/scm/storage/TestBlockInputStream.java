@@ -17,6 +17,7 @@
 
 package org.apache.hadoop.hdds.scm.storage;
 
+import static java.util.Arrays.asList;
 import static org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result.CONTAINER_NOT_FOUND;
 import static org.apache.hadoop.hdds.scm.storage.PositionedReadTestHelper.BUFFER_SIZE;
 import static org.apache.hadoop.hdds.scm.storage.PositionedReadTestHelper.SOURCE_SIZE;
@@ -32,6 +33,8 @@ import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -40,9 +43,11 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -55,6 +60,7 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChecksumType;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos.BlockTokenSecretProto.AccessModeProto;
 import org.apache.hadoop.hdds.scm.OzoneClientConfig;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
@@ -62,8 +68,11 @@ import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerExcep
 import org.apache.hadoop.hdds.scm.pipeline.MockPipeline;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
+import org.apache.hadoop.hdds.security.token.OzoneBlockTokenIdentifier;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.ozone.common.OzoneChecksumException;
+import org.apache.hadoop.security.token.Token;
 import org.apache.ozone.test.GenericTestUtils;
 import org.apache.ozone.test.GenericTestUtils.LogCapturer;
 import org.apache.ratis.thirdparty.io.grpc.Status;
@@ -410,6 +419,71 @@ public class TestBlockInputStream {
     } finally {
       reset(this.refreshFunction);
     }
+  }
+
+  @Test
+  void encodesTokenOnceAndSendsRefreshedToken() throws Exception {
+    BlockID blockID = new BlockID(new ContainerBlockID(1, 1));
+    Token<OzoneBlockTokenIdentifier> realToken = newBlockToken(blockID, 1000);
+    Token<OzoneBlockTokenIdentifier> realNewToken = newBlockToken(blockID, 2000);
+    String encoded = realToken.encodeToUrlString();
+    String newEncoded = realNewToken.encodeToUrlString();
+    Token<OzoneBlockTokenIdentifier> token = spy(realToken);
+    Token<OzoneBlockTokenIdentifier> newToken = spy(realNewToken);
+
+    Pipeline pipeline = MockPipeline.createSingleNodePipeline();
+    BlockLocationInfo newBlockInfo = mock(BlockLocationInfo.class);
+    when(newBlockInfo.getPipeline()).thenReturn(pipeline);
+    when(newBlockInfo.getToken()).thenReturn(newToken);
+    when(refreshFunction.apply(any())).thenReturn(newBlockInfo);
+
+    final int len = 200;
+    ChunkInputStream stream = throwingChunkInputStreamForPositionedRead(
+        new StorageContainerException("test", CONTAINER_NOT_FOUND), len, true);
+    List<String> sentTokens = new ArrayList<>();
+    try (BlockInputStream subject = new BlockInputStream(
+        new BlockLocationInfo(new BlockLocationInfo.Builder().setBlockID(blockID).setLength(blockSize)),
+        pipeline, token, null, refreshFunction, clientConfig) {
+      @Override
+      protected ContainerProtos.BlockData getBlockDataUsingGRPCClient(XceiverClientSpi client, Pipeline p,
+          String encodedToken) {
+        sentTokens.add(encodedToken);
+        return ContainerProtos.BlockData.newBuilder().addAllChunks(chunks)
+            .setBlockID(blockID.getDatanodeBlockIDProtobuf()).build();
+      }
+
+      @Override
+      protected ChunkInputStream createChunkInputStream(ChunkInfo chunkInfo) {
+        return stream;
+      }
+
+      @Override
+      protected synchronized void checkOpen() {
+        // there is no client factory, which checkOpen would report as closed
+      }
+    }) {
+      // the token is encoded by the first request, not by the constructor
+      verify(token, never()).encodeToUrlString();
+      subject.initialize();
+      subject.getBlockData();
+      // the first attempt fails, which refreshes the pipeline and the token
+      assertEquals(len, subject.readPositioned(0, ByteBuffer.allocate(len)));
+      subject.getBlockData();
+      subject.getBlockData();
+    } finally {
+      reset(refreshFunction);
+    }
+
+    assertEquals(asList(encoded, encoded, newEncoded, newEncoded), sentTokens);
+    verify(token, times(1)).encodeToUrlString();
+    verify(newToken, times(1)).encodeToUrlString();
+  }
+
+  static Token<OzoneBlockTokenIdentifier> newBlockToken(BlockID blockID, long expiryDate) {
+    OzoneBlockTokenIdentifier identifier = new OzoneBlockTokenIdentifier("owner", blockID,
+        EnumSet.of(AccessModeProto.READ), expiryDate, 100);
+    identifier.setSecretKeyId(UUID.randomUUID());
+    return new Token<>(identifier.getBytes(), new byte[0], identifier.getKind(), new Text(identifier.getService()));
   }
 
   private static Stream<Arguments> exceptionsNotTriggerRefresh() {

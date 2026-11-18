@@ -59,7 +59,6 @@ import org.apache.hadoop.hdds.scm.pipeline.MockPipeline;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.ozone.common.ChunkBuffer;
-import org.apache.hadoop.security.token.Token;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -456,15 +455,8 @@ public class TestChunkInputStream {
     Pipeline pipeline = MockPipeline.createSingleNodePipeline();
     Pipeline newPipeline = MockPipeline.createSingleNodePipeline();
 
-    Token<?> token = mock(Token.class);
-    when(token.encodeToUrlString())
-        .thenReturn("oldToken");
-    Token<?> newToken = mock(Token.class);
-    when(newToken.encodeToUrlString())
-        .thenReturn("newToken");
-
     AtomicReference<Pipeline> pipelineRef = new AtomicReference<>(pipeline);
-    AtomicReference<Token<?>> tokenRef = new AtomicReference<>(token);
+    AtomicReference<String> tokenRef = new AtomicReference<>("oldToken");
 
     XceiverClientFactory clientFactory = mock(XceiverClientFactory.class);
     XceiverClientSpi client = mock(XceiverClientSpi.class);
@@ -488,7 +480,7 @@ public class TestChunkInputStream {
       // WHEN
       subject.unbuffer();
       pipelineRef.set(newPipeline);
-      tokenRef.set(newToken);
+      tokenRef.set("newToken");
       byte[] buffer = new byte[CHUNK_SIZE];
       int read = subject.read(buffer);
 
@@ -496,7 +488,7 @@ public class TestChunkInputStream {
       assertEquals(CHUNK_SIZE, read);
       assertArrayEquals(chunkData, buffer);
       verify(clientFactory).acquireClientForReadData(newPipeline);
-      verify(newToken).encodeToUrlString();
+      assertEquals("newToken", requestCaptor.getValue().getEncodedToken());
     }
   }
 }

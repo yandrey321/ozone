@@ -19,6 +19,7 @@ package org.apache.hadoop.hdds.scm.storage;
 
 import static org.apache.hadoop.hdds.scm.storage.PositionedReadTestHelper.BUFFER_SIZE;
 import static org.apache.hadoop.hdds.scm.storage.PositionedReadTestHelper.SOURCE_SIZE;
+import static org.apache.hadoop.hdds.scm.storage.TestBlockInputStream.newBlockToken;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -33,6 +34,7 @@ import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -151,6 +153,30 @@ public class TestStreamBlockInputStream {
     for (StreamingReadResponse response : readers.keySet()) {
       verify(response.getRequestObserver()).onCompleted();
     }
+  }
+
+  @Test
+  public void testTokenIsEncodedOnceByTheFirstRequest() throws Exception {
+    byte[] data = new byte[100];
+    BlockID blockID = new BlockID(1L, 17L);
+    Token<OzoneBlockTokenIdentifier> realToken = newBlockToken(blockID, 1000);
+    String encoded = realToken.encodeToUrlString();
+    Token<OzoneBlockTokenIdentifier> token = spy(realToken);
+    XceiverClientGrpc client = mockOffsetAwareStreamingReadClient(data, mock(ClientCallStreamObserver.class));
+    XceiverClientFactory factory = mock(XceiverClientFactory.class);
+    when(factory.acquireClientForReadData(any(Pipeline.class))).thenReturn(client);
+    try (StreamBlockInputStream stream = new StreamBlockInputStream(newBlockInfo(blockID, data.length),
+        mockStandalonePipeline(), token, factory, NO_REFRESH, newStreamReadConfig())) {
+      verify(token, never()).encodeToUrlString();
+      assertEquals(10, stream.readPositioned(50, ByteBuffer.allocate(10)));
+      assertEquals(10, stream.readPositioned(20, ByteBuffer.allocate(10)));
+      assertEquals(10, stream.read(new byte[10], 0, 10));
+    }
+
+    ArgumentCaptor<ContainerCommandRequestProto> requests = ArgumentCaptor.forClass(ContainerCommandRequestProto.class);
+    verify(client, times(3)).streamRead(requests.capture(), any());
+    assertThat(requests.getAllValues()).allSatisfy(request -> assertEquals(encoded, request.getEncodedToken()));
+    verify(token, times(1)).encodeToUrlString();
   }
 
   @Test

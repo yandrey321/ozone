@@ -39,7 +39,6 @@ import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.ozone.common.ChecksumData;
 import org.apache.hadoop.ozone.common.OzoneChecksumException;
 import org.apache.hadoop.ozone.common.utils.BufferUtils;
-import org.apache.hadoop.security.token.Token;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -60,11 +59,11 @@ public class LocalChunkInputStream extends ChunkInputStream
 
   @SuppressWarnings("checkstyle:parameternumber")
   LocalChunkInputStream(ChunkInfo chunkInfo, BlockID blockId, XceiverClientFactory xceiverClientFactory,
-      Supplier<Pipeline> pipelineSupplier, boolean verifyChecksum, Supplier<Token<?>> tokenSupplier,
+      Supplier<Pipeline> pipelineSupplier, boolean verifyChecksum, Supplier<String> encodedTokenSupplier,
       XceiverClientShortCircuit xceiverClientShortCircuit, FileChannel dataIn) {
     // Pass null for xceiverClientFactory such readPositioned() is taken, both routing reads
     // and checksum verification are done locally.
-    super(chunkInfo, blockId, null, pipelineSupplier, verifyChecksum, tokenSupplier);
+    super(chunkInfo, blockId, null, pipelineSupplier, verifyChecksum, encodedTokenSupplier);
     this.chunkInfo = chunkInfo;
     this.dataIn = dataIn;
     this.validator = this::validateChunk;

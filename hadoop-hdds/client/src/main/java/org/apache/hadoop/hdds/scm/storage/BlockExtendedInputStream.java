@@ -108,9 +108,9 @@ public abstract class BlockExtendedInputStream extends ExtendedInputStream
   }
 
   protected BlockData getBlockDataUsingGRPCClient(XceiverClientSpi client, Pipeline pipeline,
-      Token<OzoneBlockTokenIdentifier> token) throws IOException {
+      String encodedToken) throws IOException {
     LOG.debug("Get block info for block {}", getBlockID());
-    return ContainerProtocolCalls.getBlock(client, VALIDATORS, getBlockID(), token, pipeline).getBlockData();
+    return ContainerProtocolCalls.getBlock(client, VALIDATORS, getBlockID(), encodedToken, pipeline).getBlockData();
   }
 
   private static void validate(ContainerCommandResponseProto response) throws IOException {
@@ -141,8 +141,29 @@ public abstract class BlockExtendedInputStream extends ExtendedInputStream
         TimeUnit.SECONDS.toMillis(config.getReadRetryInterval()));
   }
 
+  /**
+   * Encode a block token once, so that the read requests for a block can reuse the encoding.
+   * @return the URL-safe encoding of the token, or null if there is no token.
+   */
+  protected static String encodeToken(Token<OzoneBlockTokenIdentifier> token) throws IOException {
+    return token != null ? token.encodeToUrlString() : null;
+  }
+
+  /**
+   * Encode the token given to the stream's constructor, if it is not encoded yet. Called with the stream lock held
+   * before the first request for the block, so that a stream that is never read does not encode its token.
+   */
+  protected static void encodePendingToken(AtomicReference<Token<OzoneBlockTokenIdentifier>> pendingTokenRef,
+      AtomicReference<String> encodedTokenRef) throws IOException {
+    final Token<OzoneBlockTokenIdentifier> token = pendingTokenRef.get();
+    if (token != null) {
+      encodedTokenRef.set(token.encodeToUrlString());
+      pendingTokenRef.set(null);
+    }
+  }
+
   protected void refreshBlockInfo(IOException cause, BlockID blockID, AtomicReference<Pipeline> pipelineRef,
-      AtomicReference<Token<OzoneBlockTokenIdentifier>> tokenRef, Function<BlockID, BlockLocationInfo> refreshFunction)
+      AtomicReference<String> encodedTokenRef, Function<BlockID, BlockLocationInfo> refreshFunction)
       throws IOException {
     LOG.info("Attempting to update pipeline and block token for block {} from pipeline {}: {}",
         blockID, pipelineRef.get().getId(), cause.getMessage());
@@ -152,13 +173,16 @@ public abstract class BlockExtendedInputStream extends ExtendedInputStream
       if (blockLocationInfo == null) {
         LOG.warn("No new block location info for block {}", blockID);
       } else {
+        final Token<OzoneBlockTokenIdentifier> token = blockLocationInfo.getToken();
+        // Encode before updating any state, so that a failure leaves the old pipeline and token in place.
+        final String encodedToken = encodeToken(token);
         pipelineRef.set(setPipeline(blockLocationInfo.getPipeline()));
         LOG.info("New pipeline for block {}: {}", blockID, blockLocationInfo.getPipeline());
 
-        tokenRef.set(blockLocationInfo.getToken());
-        if (blockLocationInfo.getToken() != null) {
+        encodedTokenRef.set(encodedToken);
+        if (token != null) {
           OzoneBlockTokenIdentifier tokenId = new OzoneBlockTokenIdentifier();
-          tokenId.readFromByteArray(tokenRef.get().getIdentifier());
+          tokenId.readFromByteArray(token.getIdentifier());
           LOG.info("A new token is added for block {}. Expiry: {}", blockID,
               Instant.ofEpochMilli(tokenId.getExpiryDate()));
         }

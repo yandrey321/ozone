@@ -347,7 +347,7 @@ public class TestXceiverClientGrpc {
             .setOffset(0)
             .build(),
         bid.getDatanodeBlockIDProtobuf(),
-        null, null);
+        null, (String) null);
   }
 
   private XceiverClientReply buildReadChunkResponse(

@@ -47,8 +47,6 @@ import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.ozone.common.ChecksumData;
 import org.apache.hadoop.ozone.common.OzoneChecksumException;
 import org.apache.hadoop.ozone.common.utils.BufferUtils;
-import org.apache.hadoop.security.token.Token;
-import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /**
@@ -99,7 +97,7 @@ public class ChunkInputStream extends InputStream
   // retry.  Once the chunk is read, this variable is reset.
   private long chunkPosition = -1;
 
-  private final Supplier<Token<?>> tokenSupplier;
+  private final Supplier<String> encodedTokenSupplier;
 
   private static final int EOF = -1;
   private final List<Validator> validators;
@@ -108,7 +106,7 @@ public class ChunkInputStream extends InputStream
       XceiverClientFactory xceiverClientFactory,
       Supplier<Pipeline> pipelineSupplier,
       boolean verifyChecksum,
-      Supplier<Token<?>> tokenSupplier) {
+      Supplier<String> encodedTokenSupplier) {
     this.chunkInfo = chunkInfo;
     this.length = chunkInfo.getLen();
     this.blockID = blockId;
@@ -116,7 +114,7 @@ public class ChunkInputStream extends InputStream
     this.pipelineSupplier = pipelineSupplier;
     this.verifyChecksum = verifyChecksum;
     this.reader = new ChunkReader(chunkInfo, verifyChecksum, this::readChunkPositioned);
-    this.tokenSupplier = tokenSupplier;
+    this.encodedTokenSupplier = encodedTokenSupplier;
     validators = ContainerProtocolCalls.toValidatorList(this::validateChunk);
   }
 
@@ -423,7 +421,7 @@ public class ChunkInputStream extends InputStream
     final DatanodeBlockID bid = buildDatanodeBlockId(pipeline);
     final XceiverClientSpi client = xceiverClientFactory.acquireClientForReadData(pipeline);
     try {
-      return readChunk(range, client, bid, validators, tokenSupplier.get());
+      return readChunk(range, client, bid, validators, encodedTokenSupplier.get());
     } finally {
       xceiverClientFactory.releaseClientForReadData(client, false);
     }
@@ -436,7 +434,7 @@ public class ChunkInputStream extends InputStream
    */
   @VisibleForTesting
   protected ByteBuffer[] readChunk(ChunkInfo readChunkInfo) throws IOException {
-    return readChunk(readChunkInfo, xceiverClient, datanodeBlockID, validators, tokenSupplier.get());
+    return readChunk(readChunkInfo, xceiverClient, datanodeBlockID, validators, encodedTokenSupplier.get());
   }
 
   /**
@@ -445,10 +443,10 @@ public class ChunkInputStream extends InputStream
    */
   private static ByteBuffer[] readChunk(
       ChunkInfo chunk, XceiverClientSpi client, DatanodeBlockID blockID,
-      List<Validator> validators, Token<? extends TokenIdentifier> token) throws IOException {
+      List<Validator> validators, String encodedToken) throws IOException {
     Objects.requireNonNull(client, "client");
     final ReadChunkResponseProto readChunkResponse = ContainerProtocolCalls.readChunk(
-        client, chunk, blockID, validators, token);
+        client, chunk, blockID, validators, encodedToken);
 
     if (readChunkResponse.hasData()) {
       return readChunkResponse.getData().asReadOnlyByteBufferList()

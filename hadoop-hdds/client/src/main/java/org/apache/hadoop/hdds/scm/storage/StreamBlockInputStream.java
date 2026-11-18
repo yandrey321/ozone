@@ -85,7 +85,10 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
   private final Duration readTimeout;
   private final long readTimeoutNanos;
   private final AtomicReference<Pipeline> pipelineRef = new AtomicReference<>();
-  private final AtomicReference<Token<OzoneBlockTokenIdentifier>> tokenRef = new AtomicReference<>();
+  // The token given to the constructor, until the first request encodes it (see ensureTokenEncoded).
+  private final AtomicReference<Token<OzoneBlockTokenIdentifier>> pendingTokenRef = new AtomicReference<>();
+  // The block token, encoded once and reused by every request for this block.
+  private final AtomicReference<String> encodedTokenRef = new AtomicReference<>();
   private XceiverClientFactory xceiverClientFactory;
   private XceiverClientGrpc xceiverClient;
 
@@ -111,7 +114,7 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
     this.blockLength = blockInfo.getLength();
     this.needUpdateBlockLength = blockInfo.isUnderConstruction();
     pipelineRef.set(setPipeline(pipeline));
-    tokenRef.set(token);
+    pendingTokenRef.set(token);
     this.xceiverClientFactory = xceiverClientFactory;
     this.verifyChecksum = config.isChecksumVerify();
     this.retryPolicy = getReadRetryPolicy(config);
@@ -235,7 +238,7 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
       throw new IOException("Uninitialized StreamingReadResponse: " + blockID);
     }
     client.streamRead(ContainerProtocolCalls.buildReadBlockCommandProto(
-        blockID, blockOffset, length, responseDataSize, verifyChecksum, tokenRef.get(), pipeline), response);
+        blockID, blockOffset, length, responseDataSize, verifyChecksum, encodedTokenRef.get(), pipeline), response);
 
     int copied = 0;
     while (copied < length) {
@@ -443,10 +446,12 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
    * since the length from OM may be stale (e.g. the last block of an hsync-ed file).
    */
   public synchronized void updateBlockLength() throws IOException {
+    // Every request for the block is sent by or after updateBlockLength() or initialize().
+    ensureTokenEncoded();
     while (needUpdateBlockLength) {
       try {
         acquireClient();
-        blockLength = getBlockDataUsingGRPCClient(xceiverClient, pipelineRef.get(), tokenRef.get()).getSize();
+        blockLength = getBlockDataUsingGRPCClient(xceiverClient, pipelineRef.get(), encodedTokenRef.get()).getSize();
         needUpdateBlockLength = false;
         retries = 0;
         LOG.debug("{}: Updated block length to {} for block {}", name, blockLength, blockID);
@@ -459,6 +464,7 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
   }
 
   private synchronized void initialize() throws IOException {
+    ensureTokenEncoded();
     while (streamingReader == null) {
       try {
         acquireClient();
@@ -501,7 +507,8 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
       throw new IOException("Uninitialized StreamingReadResponse: " + blockID);
     }
     xceiverClient.streamRead(ContainerProtocolCalls.buildReadBlockCommandProto(
-        blockID, requestedLength, length, responseDataSize, verifyChecksum, tokenRef.get(), pipelineRef.get()), r);
+        blockID, requestedLength, length, responseDataSize, verifyChecksum, encodedTokenRef.get(), pipelineRef.get()),
+        r);
   }
 
   /**
@@ -565,7 +572,14 @@ public class StreamBlockInputStream extends BlockExtendedInputStream {
   }
 
   private void refreshBlockInfo(IOException cause) throws IOException {
-    refreshBlockInfo(cause, blockID, pipelineRef, tokenRef, refreshFunction);
+    // so that the token from the constructor can never overwrite the refreshed one
+    ensureTokenEncoded();
+    refreshBlockInfo(cause, blockID, pipelineRef, encodedTokenRef, refreshFunction);
+  }
+
+  /** Encode the block token before the first request for this block. */
+  private synchronized void ensureTokenEncoded() throws IOException {
+    encodePendingToken(pendingTokenRef, encodedTokenRef);
   }
 
   @Override
